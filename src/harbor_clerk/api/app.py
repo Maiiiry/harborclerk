@@ -1,4 +1,5 @@
 import asyncio
+import importlib.metadata
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -377,6 +378,31 @@ async def lifespan(app: FastAPI):
 
 
 BUILD_HASH = os.environ.get("BUILD_HASH", "dev")
+
+
+def build_version() -> str:
+    """The version of the running build, for ``/api/system/health``.
+
+    A packaged macOS app exports ``BUILD_VERSION`` from ``venv/build-version.txt``,
+    which ``macos/scripts/package.sh`` derives from ``git describe`` of the commit
+    it built (``macos/scripts/build-version.sh``): ``0.9.3`` for a clean build of
+    the tagged commit, ``0.9.3+2.g887c3fb[.dirty]`` for anything else, so a
+    development build is never mistaken for a release.
+
+    Without the stamp — Docker, ``uv run``, a bundle assembled before the stamp
+    existed — this is the installed package's version (``pyproject.toml``'s,
+    which ``release.sh`` holds equal to the tag) with ``+unstamped`` appended:
+    the package version is the same for every commit after the bump, so a bare
+    number must stay something only a stamped release build can report.
+    Read per call rather than at import so a test can set the environment.
+    """
+    stamped = os.environ.get("BUILD_VERSION", "").strip()
+    if stamped:
+        return stamped
+    try:
+        return f"{importlib.metadata.version('harbor-clerk')}+unstamped"
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.0+unstamped"
 
 
 def create_app() -> FastAPI:
