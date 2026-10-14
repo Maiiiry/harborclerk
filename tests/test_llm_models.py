@@ -311,8 +311,9 @@ def test_the_launcher_bounds_what_llama_server_keeps_in_host_ram_and_the_budget_
     )
     assert re.search(r'"--ctx-checkpoints",\s*String\(MemoryBudget\.ctxCheckpoints\)', launcher)
     assert launcher.count('"--ctx-checkpoints"') == 1
-    # The context and the cache are both sized from the fixed cost WITH the checkpoints in it.
-    assert launcher.count("fixedBytes: settings.activeModelFixedBytes") == 2
+    # The context, the cache and the refusal's "needs about M GB" (#709) are all sized from the fixed cost WITH
+    # the checkpoints in it, as `min_ram_gb` is through `fixed_bytes()`.
+    assert launcher.count("fixedBytes: settings.activeModelFixedBytes") == 3
     assert "activeModelKvFixedBytes" not in launcher, "that is the fixed KV alone: the checkpoints would be unbudgeted"
     for path in sorted(SWIFT_APP.rglob("*.swift")):
         source = _swift(str(path.relative_to(SWIFT_APP)))
@@ -749,3 +750,7 @@ def test_swift_mirrors_the_registrys_memory_tables():
         ("promptCacheMinTokens", PROMPT_CACHE_MIN_TOKENS),
     ):
         assert re.search(rf"static let {name} = {value:_}\b", swift), name
+    from harbor_clerk.llm.models import MAC_RAM_TIERS_GB
+
+    # The launcher's refusal says "needs about M GB" from the same tiers the Models page rounds to (#709).
+    assert f"static let macRamTiersGB = [{', '.join(str(t) for t in MAC_RAM_TIERS_GB)}]" in swift
