@@ -239,6 +239,59 @@ def keys(cfg: AcceptanceConfig, admin: HarborClerk, corpus: Corpus) -> Iterator[
         pytest.fail(f"API keys created by this run could not be deleted and are still active: {failed}")
 
 
+def failure_target(groundtruth: dict[str, Any]) -> str:
+    """The fixture `groundtruth.yaml` marks `failure_target`; D5 breaks this one."""
+    return next(name for name, spec in groundtruth["fixtures"].items() if spec.get("failure_target"))
+
+
+def _wait_for_injected_failure(admin: HarborClerk, doc_id: str, *, timeout_s: float) -> dict[str, Any]:
+    """The failed document, or a skip when it became ready instead: the file
+    mode did not bind the worker (a Compose instance with no `user:` runs as root)."""
+    try:
+        return admin.wait_for_document_error(doc_id, timeout_s=timeout_s)
+    except RuntimeError as e:
+        pytest.skip(f"cannot inject an unreadable source on this instance: {e}")
+
+
+@pytest.fixture(scope="session")
+def failed_document(cfg: AcceptanceConfig, admin: HarborClerk, corpus: Corpus) -> Iterator[dict[str, Any]]:
+    """A fixture document whose extract stage failed with an error quoting its
+    absolute path, for D5.
+
+    The file is ingested with the rest of the corpus, then made unreadable and
+    reprocessed. The order matters: the watcher hashes a file before it
+    registers it, so a file that is unreadable from the start never becomes a
+    document, while the extract stage checks only that the path exists before
+    reading it and fails with ``PermissionError: [Errno 13] Permission denied:
+    '<absolute path>'`` — the text `describe_error` stores on the job and the
+    document. Read permission is restored when the session ends, before the
+    folder and its files are removed. When the worker ignores the mode (a
+    Compose instance with no `user:` runs as root) the document becomes ready
+    again and the check is skipped with that reason; when it fails but the
+    recorded error does not quote the path, the fixture fails rather than
+    yields, since D5 would then prove nothing."""
+    name = failure_target(corpus.groundtruth)
+    path = corpus.fixtures[name].path
+    doc_id = corpus.doc_id(name)
+    mode = path.stat().st_mode
+    path.chmod(0)
+    try:
+        admin.reprocess_document(doc_id)
+        doc = _wait_for_injected_failure(admin, doc_id, timeout_s=cfg.ingest_timeout_s)
+        error = doc.get("error") or ""
+        if corpus.folder_path not in error:
+            pytest.fail(f"the failed document's error does not quote its path, so D5 cannot test redaction: {error!r}")
+        yield doc
+    finally:
+        # Until here the document sits in pipeline_status=error for the rest of
+        # the session (every check after D5 must tolerate that). Restoring the
+        # mode and reprocessing brings it back to ready, so a corpus-wide
+        # readiness check added after D5 does not trip on it; the folder delete
+        # at session end does not wait for the reprocess.
+        path.chmod(mode)
+        admin.reprocess_document(doc_id)
+
+
 @pytest.fixture(scope="session")
 def empty_folder(cfg: AcceptanceConfig, admin: HarborClerk, corpus: Corpus) -> Iterator[dict[str, Any]]:
     """A second, registered, empty watched folder: a key scoped to it can see

@@ -31,6 +31,7 @@ from harbor_clerk.auth import generate_api_key, hash_api_key
 from harbor_clerk.models import ApiKey, Chunk, Document, DocumentPage, IngestionJob
 from harbor_clerk.models.enums import JobStage, JobStatus, PipelineStatus
 from harbor_clerk.models.watched import WatchedFile, WatchedFileStatus, WatchedFolder
+from harbor_clerk.search_types import FindAllHit, FindAllResult, SearchHit, SearchResult
 from tests.conftest import auth_header
 
 TIER_RANK = {"search": 0, "read": 1, "full": 2}
@@ -447,6 +448,84 @@ async def test_key_gets_no_folder_label_derived_from_the_on_disk_path(
     (item,) = key.json()["items"]
     assert item["folder_name"] is None
     assert "Secret Folder" not in key.text
+
+
+async def test_key_gets_no_folder_label_derived_from_the_on_disk_path_in_source_refs(
+    client, db_session, corpus, make_key, admin_token, monkeypatch
+) -> None:
+    """The same rule for the SourceRef the search and passage routes attach to
+    every hit (``folder_label``); a human session keeps the leaf."""
+    corpus.folder.display_name = None
+    await db_session.flush()
+
+    async def fake_hybrid_search(*args, **kwargs):
+        return SearchResult(
+            hits=[
+                SearchHit(
+                    chunk_id=str(corpus.chunk.chunk_id),
+                    doc_id=str(corpus.doc.doc_id),
+                    chunk_num=0,
+                    chunk_text=corpus.chunk.chunk_text,
+                    page_start=1,
+                    page_end=1,
+                    language="en",
+                    ocr_used=False,
+                    ocr_confidence=None,
+                    score=0.9,
+                    doc_title="Board Packet",
+                )
+            ],
+            total_candidates=1,
+            reranker_status="disabled",
+        )
+
+    async def fake_find_all(*args, **kwargs):
+        return FindAllResult(
+            hits=[
+                FindAllHit(
+                    doc_id=str(corpus.doc.doc_id),
+                    doc_title="Board Packet",
+                    mime_type="application/pdf",
+                    language="en",
+                    score=0.9,
+                    ingested_at=datetime.now(UTC),
+                    page_range="1",
+                    top_chunk_id=str(corpus.chunk.chunk_id),
+                    top_chunk_text=corpus.chunk.chunk_text,
+                    top_chunk_page=1,
+                    top_chunk_heading=None,
+                )
+            ],
+            total_matches=1,
+            offset=0,
+            truncated=False,
+            sort_by="relevance",
+            presentation="full",
+        )
+
+    monkeypatch.setattr("harbor_clerk.api.routes.search.hybrid_search", fake_hybrid_search)
+    monkeypatch.setattr("harbor_clerk.api.routes.search.find_all", fake_find_all)
+    # Every route that attaches a SourceRef, with the key its rows sit under.
+    routes = (
+        ("/api/search", {"query": "board packet"}, "hits"),
+        ("/api/search/find-all", {"query": "packet"}, "results"),
+        ("/api/passages/read", {"chunk_ids": [str(corpus.chunk.chunk_id)]}, "passages"),
+    )
+
+    human = auth_header(admin_token)
+    for path, body, rows in routes:
+        resp = await client.post(path, json=body, headers=human)
+        assert resp.status_code == 200, (path, resp.text[:300])
+        (row,) = resp.json()[rows]
+        assert row["source"]["folder_label"] == "Secret Folder", path
+
+    key = auth_header(await make_key("full"))
+    for path, body, rows in routes:
+        resp = await client.post(path, json=body, headers=key)
+        assert resp.status_code == 200, (path, resp.text[:300])
+        (row,) = resp.json()[rows]
+        assert row["source"].get("folder_label") is None, path
+        assert "Secret Folder" not in resp.text, path
 
 
 # --- audit log --------------------------------------------------------------

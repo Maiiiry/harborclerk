@@ -129,6 +129,36 @@ tolerates the empty-choices chunk (`research.py`'s streaming reader does not
 ask for usage and still indexes `choices[0]`: asking without fixing the reader
 crashes it).
 
+## Paths over MCP
+
+The rule on both surfaces is the same, and keyed on one test: `principal.type
+== "user"` is the signed-in human — a web-app request over REST, or the chat and
+research tools, which run the `kb_*` functions in-process under
+`Principal(type="user")` (`llm/tools.py`). The only other MCP principal types
+are `api_key` and `oauth`, and both are external agents: they keep the MCP
+contract of never receiving a path component (`tests/test_mcp_source_ref.py`),
+while the human keeps the folder leaf in chat citations and the whole error text
+in a tool chip, exactly as the web app shows them. The test describes the
+credential, not the client: any JWT holder on the MCP port is the human, so a
+harness that wants the agent view (the eval runner, a scripted client) must
+authenticate with an API key — `answer_eval.py` warns when it falls back to a
+login.
+
+Concretely, in `mcp_server.py`: `_human_session()` is the predicate; every tool
+loads its SourceRef context through `_source_context()`, which passes
+`folder_label_from_path=_human_session()` to `load_source_ref_context` (never
+call the loader directly from a tool); and pipeline error text goes through
+`_error_text()` — `redact_path_tokens` from `api/scope.py` for an agent,
+unchanged for the human (`kb_get_document` and `kb_ingest_status` today). The
+REST search, find-all and passage routes pass `folder_label_from_path=
+principal.type == "user"`, the test `documents.py` applies to `folder_name`.
+`kb_get_document` reports a stage failure as `pipeline_error`, present only when
+one failed: the chat tools read a top-level `error` key as "the call failed"
+and render it verbatim with no citation (`llm/tools.py::summarize_tool_result`,
+`llm/citations.py`), so no healthy payload may carry a key of that name.
+Acceptance D5 checks the agent branch against a live instance with a document
+whose extract stage failed on a path-quoting OSError.
+
 ## Async gotchas
 
 - `enqueue_stage()` uses a **sync** session. Calling it in a loop from an async

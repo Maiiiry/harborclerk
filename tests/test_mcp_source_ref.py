@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harbor_clerk.api.deps import Principal
+from harbor_clerk.api.scope import KeyScope
 from harbor_clerk.mcp_server import (
     _mcp_principal,
     kb_batch_search,
@@ -19,13 +20,14 @@ from harbor_clerk.mcp_server import (
     kb_find_all,
     kb_find_related,
     kb_get_document,
+    kb_ingest_status,
     kb_list_recent,
     kb_read_passages,
     kb_search,
     kb_verify_identifier,
 )
-from harbor_clerk.models import Chunk, Document, DocumentLink
-from harbor_clerk.models.enums import PipelineStatus
+from harbor_clerk.models import Chunk, Document, DocumentLink, IngestionJob
+from harbor_clerk.models.enums import JobStage, JobStatus, PipelineStatus
 from harbor_clerk.models.watched import WatchedFile, WatchedFileStatus, WatchedFolder
 from harbor_clerk.search import FindAllHit, FindAllResult, SearchHit, SearchResult
 
@@ -34,6 +36,31 @@ from harbor_clerk.search import FindAllHit, FindAllResult, SearchHit, SearchResu
 def mcp_principal(admin_user):
     token = _mcp_principal.set(Principal(type="user", id=admin_user.user_id, role="admin"))
     yield
+    _mcp_principal.reset(token)
+
+
+def _full_key_scope() -> KeyScope:
+    return KeyScope(
+        scope_topic_ids=None,
+        scope_folder_ids=None,
+        permission_tier="full",
+        tool_overrides={},
+        max_snippet_chars=None,
+        rate_limit_rpm=None,
+        rate_limit_rph=None,
+    )
+
+
+@pytest.fixture(params=["api_key", "oauth"])
+def external_principal(request, admin_user):
+    """The two external agents MCP serves: an unscoped full-tier key, and an
+    OAuth client acting for the admin. Neither is the signed-in human."""
+    if request.param == "api_key":
+        principal = Principal(type="api_key", id=uuid.uuid4(), role="user", key_scope=_full_key_scope())
+    else:
+        principal = Principal(type="oauth", id=admin_user.user_id, role="admin")
+    token = _mcp_principal.set(principal)
+    yield request.param
     _mcp_principal.reset(token)
 
 
@@ -67,8 +94,15 @@ def _doc(**kwargs) -> Document:
     return Document(**defaults)
 
 
-async def _add_watched_doc(db_session: AsyncSession, doc: Document, relative_path: str = "client-a/nda.pdf") -> None:
-    folder = WatchedFolder(path="/Users/alex/private/contracts", display_name="Contracts")
+async def _add_watched_doc(
+    db_session: AsyncSession,
+    doc: Document,
+    relative_path: str = "client-a/nda.pdf",
+    *,
+    folder_path: str = "/Users/alex/private/contracts",
+    display_name: str | None = "Contracts",
+) -> None:
+    folder = WatchedFolder(path=folder_path, display_name=display_name)
     db_session.add(folder)
     await db_session.flush()
 
@@ -245,6 +279,7 @@ async def test_kb_get_document_includes_source_ref(
     assert payload["source"]["doc_id"] == str(doc.doc_id)
     assert payload["source"]["relative_path"] == "board/packet.pdf"
     assert "source_path" not in payload
+    assert "pipeline_error" not in payload  # a healthy document carries no error key of any name
     assert "/Users/alex" not in json.dumps(payload)
 
 
@@ -335,3 +370,109 @@ async def test_kb_verify_identifier_and_documents_by_date_rows_include_source_re
     assert row["citation"] == "Pinnacle Contract"
     assert row["source"]["relative_path"] == "contracts/pinnacle.pdf"
     assert "/Users/alex" not in json.dumps(row)
+
+
+# A stage stores describe_error(exc); an OSError quotes the on-disk file (#804).
+FAILED_ERROR = "PermissionError: [Errno 13] Permission denied: '/Users/alex/private/contracts/board/packet.pdf'"
+REDACTED_ERROR = "PermissionError: [Errno 13] Permission denied: [path]"
+UNNAMED_FOLDER = "/Users/alex/private/Secret Contracts"
+
+
+async def _add_failed_doc(db_session: AsyncSession) -> Document:
+    doc = _doc(title="Board Packet", pipeline_status=PipelineStatus.error, error=FAILED_ERROR)
+    await _add_watched_doc(db_session, doc, relative_path="board/packet.pdf")
+    db_session.add(
+        IngestionJob(
+            doc_id=doc.doc_id,
+            stage=JobStage.extract,
+            status=JobStatus.error,
+            pipeline_seq=doc.pipeline_seq,
+            error=FAILED_ERROR,
+        )
+    )
+    await db_session.flush()
+    return doc
+
+
+async def _failed_doc_errors(doc: Document) -> tuple[str, list[str], list[str]]:
+    """(pipeline_error, kb_get_document jobs[].error, kb_ingest_status jobs[].error)."""
+    detail = json.loads(await kb_get_document(str(doc.doc_id)))
+    assert detail["pipeline_status"] == "error"
+    status = json.loads(await kb_ingest_status(str(doc.doc_id)))
+    return detail["pipeline_error"], [j["error"] for j in detail["jobs"]], [j["error"] for j in status["jobs"]]
+
+
+async def test_external_agent_reads_a_failed_document_with_paths_redacted_from_every_error(
+    db_session,
+    external_principal,
+    mock_session_factory,
+) -> None:
+    """A key or OAuth agent keeps the message (what failed) and loses the path,
+    on the document and on each job, from both tools that report pipeline errors."""
+    doc = await _add_failed_doc(db_session)
+
+    pipeline_error, detail_jobs, status_jobs = await _failed_doc_errors(doc)
+    assert pipeline_error == REDACTED_ERROR
+    assert detail_jobs == [REDACTED_ERROR]
+    assert status_jobs == [REDACTED_ERROR]
+    assert "/Users/alex" not in json.dumps(await kb_get_document(str(doc.doc_id)))
+
+
+async def test_signed_in_user_reads_a_failed_document_whole(
+    db_session,
+    mcp_principal,
+    mock_session_factory,
+) -> None:
+    """The chat and research tools run as the signed-in user: the owner sees the
+    same error text in a tool chip as in the web app's document page."""
+    doc = await _add_failed_doc(db_session)
+
+    pipeline_error, detail_jobs, status_jobs = await _failed_doc_errors(doc)
+    assert pipeline_error == FAILED_ERROR
+    assert detail_jobs == [FAILED_ERROR]
+    assert status_jobs == [FAILED_ERROR]
+
+
+async def _unnamed_folder_labels(db_session: AsyncSession, monkeypatch) -> tuple[dict, dict]:
+    """(kb_search hit source, kb_get_document source) for a document in a folder with no display name."""
+    doc = _doc(title="NDA", source_path=f"{UNNAMED_FOLDER}/client-a/nda.pdf")
+    await _add_watched_doc(db_session, doc, folder_path=UNNAMED_FOLDER, display_name=None)
+    hit = _search_hit(doc)
+
+    async def fake_hybrid_search(*args, **kwargs):
+        return SearchResult(hits=[hit], total_candidates=1)
+
+    monkeypatch.setattr("harbor_clerk.mcp_server.hybrid_search", fake_hybrid_search)
+    search = json.loads(await kb_search("termination"))
+    detail = json.loads(await kb_get_document(str(doc.doc_id)))
+    assert "source_path" not in detail
+    return search["hits"][0]["source"], detail["source"]
+
+
+async def test_folder_without_display_name_yields_no_folder_label_for_external_agents(
+    db_session,
+    external_principal,
+    mock_session_factory,
+    monkeypatch,
+) -> None:
+    """Without a display name the only candidate label is the last component of
+    the on-disk folder path, a path component a key or OAuth agent never gets."""
+    hit_source, detail_source = await _unnamed_folder_labels(db_session, monkeypatch)
+
+    for source in (hit_source, detail_source):
+        assert "folder_label" not in source
+        assert source["relative_path"] == "client-a/nda.pdf"
+        assert "Secret Contracts" not in json.dumps(source)
+
+
+async def test_folder_without_display_name_is_labelled_by_its_leaf_for_the_signed_in_user(
+    db_session,
+    mcp_principal,
+    mock_session_factory,
+    monkeypatch,
+) -> None:
+    """The owner's chat citations keep naming the folder, as the web app's search page does."""
+    hit_source, detail_source = await _unnamed_folder_labels(db_session, monkeypatch)
+
+    assert hit_source["folder_label"] == "Secret Contracts"
+    assert detail_source["folder_label"] == "Secret Contracts"
