@@ -1,10 +1,12 @@
 """Tests for Alembic migration round-trips."""
 
 import os
+import threading
+import time
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
 from alembic import command
 
@@ -74,3 +76,261 @@ def test_migrating_does_not_disable_application_loggers(alembic_cfg, sync_engine
         "running a migration disabled harbor_clerk logging — any later test asserting "
         "on log output will silently capture nothing"
     )
+
+
+def _chunk_index_names(engine) -> set[str]:
+    return {ix["name"] for ix in inspect(engine).get_indexes("chunks")}
+
+
+def _fold_function_exists(engine) -> bool:
+    with engine.connect() as conn:
+        return conn.execute(text("SELECT to_regprocedure('public.hc_fold_whitespace(text)') IS NOT NULL")).scalar()
+
+
+def test_chunk_text_ws_fold_migration_round_trips(alembic_cfg, sync_engine):
+    """0008 (#819) goes down to the plain trigram index and back up to the folded one."""
+    command.upgrade(alembic_cfg, "head")
+    try:
+        command.downgrade(alembic_cfg, "0007_ingestion_job_pipeline_seq")
+        names = _chunk_index_names(sync_engine)
+        assert "ix_chunks_chunk_text_trgm" in names
+        assert "ix_chunks_chunk_text_ws_trgm" not in names
+        assert not _fold_function_exists(sync_engine)
+    finally:
+        command.upgrade(alembic_cfg, "head")
+    names = _chunk_index_names(sync_engine)
+    assert "ix_chunks_chunk_text_ws_trgm" in names
+    assert "ix_chunks_chunk_text_trgm" not in names
+    assert _fold_function_exists(sync_engine)
+
+
+def _load_0008():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "0008_chunk_text_ws_fold.py"
+    spec = importlib.util.spec_from_file_location("_mig_0008_rt", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _index_state(engine, name: str):
+    """(indisvalid, indexdef) for public.<name>, or None."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT i.indisvalid, pg_get_indexdef(i.indexrelid) FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = :n"
+            ),
+            {"n": name},
+        ).first()
+    return tuple(row) if row else None
+
+
+def _seed_invalid_index(engine, name: str) -> None:
+    """An INVALID index of this name, as an interrupted CREATE INDEX CONCURRENTLY leaves (superuser test DB)."""
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE INDEX {name} ON public.chunks (chunk_num)"))
+        conn.execute(text(f"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.{name}'::regclass"))
+
+
+def _drop_invalid_leftovers(engine, *names: str) -> None:
+    """Cleanup that holds even when the migration under test regressed and left an INVALID index."""
+    for name in names:
+        state = _index_state(engine, name)
+        if state is not None and state[0] is False:
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP INDEX IF EXISTS public.{name}"))
+
+
+def test_0008_upgrade_rebuilds_an_invalid_leftover_index(alembic_cfg, sync_engine):
+    """A retry after an interrupted build finds the function committed and an INVALID
+    ix_chunks_chunk_text_ws_trgm; it must rebuild it, not skip it and drop the valid plain index."""
+    mig = _load_0008()
+    command.upgrade(alembic_cfg, "head")
+    try:
+        command.downgrade(alembic_cfg, "0007_ingestion_job_pipeline_seq")
+        with sync_engine.begin() as conn:
+            conn.execute(text(mig._FUNCTION_DDL.format(name=mig.FOLD_FUNCTION)))
+        _seed_invalid_index(sync_engine, mig.FOLD_INDEX)
+        assert _index_state(sync_engine, mig.FOLD_INDEX)[0] is False
+
+        command.upgrade(alembic_cfg, "head")
+
+        valid, indexdef = _index_state(sync_engine, mig.FOLD_INDEX)
+        assert valid is True
+        assert "hc_fold_whitespace(chunk_text)" in indexdef and "gin_trgm_ops" in indexdef
+        assert _index_state(sync_engine, mig.PLAIN_INDEX) is None
+    finally:
+        _drop_invalid_leftovers(sync_engine, mig.FOLD_INDEX, mig.PLAIN_INDEX)
+        command.upgrade(alembic_cfg, "head")
+
+
+def test_0008_downgrade_rebuilds_an_invalid_leftover_index(alembic_cfg, sync_engine):
+    mig = _load_0008()
+    command.upgrade(alembic_cfg, "head")
+    try:
+        _seed_invalid_index(sync_engine, mig.PLAIN_INDEX)
+
+        command.downgrade(alembic_cfg, "0007_ingestion_job_pipeline_seq")
+
+        valid, indexdef = _index_state(sync_engine, mig.PLAIN_INDEX)
+        assert valid is True
+        assert "gin_trgm_ops" in indexdef and "(chunk_text gin_trgm_ops)" in indexdef
+        assert _index_state(sync_engine, mig.FOLD_INDEX) is None
+    finally:
+        _drop_invalid_leftovers(sync_engine, mig.FOLD_INDEX, mig.PLAIN_INDEX)
+        command.upgrade(alembic_cfg, "head")
+
+
+def test_0008_refuses_to_drop_the_old_index_when_the_new_one_is_invalid(sync_engine):
+    """The post-build check: an index left INVALID after the CREATE raises before anything is dropped."""
+    mig = _load_0008()
+    name = "ix_test_0008_left_invalid"
+    ddl = (
+        f"CREATE INDEX IF NOT EXISTS {name} ON public.chunks (chunk_num); "
+        f"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.{name}'::regclass"
+    )
+    with sync_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        try:
+            with pytest.raises(RuntimeError, match="INVALID"):
+                mig._build_index_concurrently(conn, name, ddl)
+        finally:
+            conn.execute(text(f"DROP INDEX IF EXISTS public.{name}"))
+
+
+def _variant_function_ddl(variant: str) -> str:
+    mig = _load_0008()
+    ddl = mig._FUNCTION_DDL.format(name=mig.FOLD_FUNCTION)
+    if variant == "different body":
+        return ddl.split(" RETURN ")[0] + " RETURN lower($1)"
+    if variant == "set search_path":
+        return ddl.replace(" RETURN ", " SET search_path = public RETURN ", 1)
+    if variant == "security definer":
+        return ddl.replace(" RETURN ", " SECURITY DEFINER RETURN ", 1)
+    if variant == "parallel unsafe":
+        return ddl.replace("PARALLEL SAFE", "PARALLEL UNSAFE", 1)
+    raise AssertionError(variant)
+
+
+@pytest.mark.parametrize("variant", ["different body", "set search_path", "security definer", "parallel unsafe"])
+def test_0008_refuses_a_fold_function_with_a_different_definition(alembic_cfg, sync_engine, variant):
+    """Never redefine the function under an expression index. A same-body function with SET options or
+    SECURITY DEFINER stops inlining (the index no longer matches); PARALLEL UNSAFE forces serial plans."""
+    command.upgrade(alembic_cfg, "head")
+    try:
+        command.downgrade(alembic_cfg, "0007_ingestion_job_pipeline_seq")
+        with sync_engine.begin() as conn:
+            conn.execute(text(_variant_function_ddl(variant)))
+        with pytest.raises(RuntimeError, match="different definition"):
+            command.upgrade(alembic_cfg, "head")
+    finally:
+        # Robust even if the check regressed and an index was built on the wrong body: drop both,
+        # restamp, rebuild from the real definition.
+        with sync_engine.begin() as conn:
+            conn.execute(text("DROP FUNCTION IF EXISTS public.hc_fold_whitespace(text) CASCADE"))
+        command.stamp(alembic_cfg, "0007_ingestion_job_pipeline_seq")
+        command.upgrade(alembic_cfg, "head")
+    assert _fold_function_exists(sync_engine)
+
+
+def _occupy_name(engine, name: str) -> None:
+    """A non-index relation holding the index's name: CREATE INDEX IF NOT EXISTS skips it, so the
+    build "succeeds" with no index, a real failure path through _require_valid without any patching."""
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE SEQUENCE public.{name}"))
+
+
+def _free_name(engine, name: str) -> None:
+    """Drop the occupying sequence, and nothing else: the name may by now be a real index."""
+    with engine.begin() as conn:
+        kind = conn.execute(text("SELECT relkind FROM pg_class WHERE oid = to_regclass(:n)"), {"n": f"public.{name}"})
+        if kind.scalar() == "S":
+            conn.execute(text(f"DROP SEQUENCE public.{name}"))
+
+
+def _restore_head(alembic_cfg, engine) -> None:
+    """Back to a healthy head even if the migration under test regressed: free occupied names, drop
+    INVALID leftovers, and if the folded index is still missing at head, restamp 0007 and rebuild."""
+    mig = _load_0008()
+    _free_name(engine, mig.FOLD_INDEX)
+    _free_name(engine, mig.PLAIN_INDEX)
+    _drop_invalid_leftovers(engine, mig.FOLD_INDEX, mig.PLAIN_INDEX)
+    command.upgrade(alembic_cfg, "head")
+    if _index_state(engine, mig.FOLD_INDEX) is None:
+        command.stamp(alembic_cfg, "0007_ingestion_job_pipeline_seq")
+        command.upgrade(alembic_cfg, "head")
+
+
+def test_0008_upgrade_keeps_the_old_index_when_the_new_build_fails(alembic_cfg, sync_engine):
+    """The plain index is dropped only after the folded one is valid."""
+    mig = _load_0008()
+    command.upgrade(alembic_cfg, "head")
+    try:
+        command.downgrade(alembic_cfg, "0007_ingestion_job_pipeline_seq")
+        _occupy_name(sync_engine, mig.FOLD_INDEX)
+        with pytest.raises(RuntimeError, match="missing or INVALID"):
+            command.upgrade(alembic_cfg, "head")
+        assert _index_state(sync_engine, mig.PLAIN_INDEX)[0] is True, "old index dropped before the new one was valid"
+    finally:
+        _restore_head(alembic_cfg, sync_engine)
+
+
+def test_0008_downgrade_keeps_the_folded_index_when_the_plain_build_fails(alembic_cfg, sync_engine):
+    mig = _load_0008()
+    command.upgrade(alembic_cfg, "head")
+    try:
+        _occupy_name(sync_engine, mig.PLAIN_INDEX)
+        with pytest.raises(RuntimeError, match="missing or INVALID"):
+            command.downgrade(alembic_cfg, "0007_ingestion_job_pipeline_seq")
+        assert _index_state(sync_engine, mig.FOLD_INDEX)[0] is True, (
+            "folded index dropped before the plain one was valid"
+        )
+    finally:
+        _restore_head(alembic_cfg, sync_engine)
+
+
+def test_0008_does_not_drop_an_index_whose_build_is_still_running(sync_engine):
+    """An orphaned build (client gone, backend still building) shows as INVALID; a retry must raise
+    and name the pid, not drop the index and start over. A real CREATE INDEX CONCURRENTLY is held in
+    its wait-for-writers phase by an open ROW EXCLUSIVE lock; every wait here is bounded."""
+    mig = _load_0008()
+    name = "ix_test_0008_in_progress"
+    ddl = f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON public.chunks (chunk_num)"
+    errors: list[Exception] = []
+
+    blocker = sync_engine.connect()
+    blocker_tx = blocker.begin()
+    blocker.execute(text("LOCK TABLE public.chunks IN ROW EXCLUSIVE MODE"))
+
+    def _build():
+        try:
+            with sync_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                conn.execute(text("SET statement_timeout = '30s'"))
+                conn.execute(text(f"CREATE INDEX CONCURRENTLY {name} ON public.chunks (chunk_num)"))
+        except Exception as exc:  # reported below, never swallowed
+            errors.append(exc)
+
+    builder = threading.Thread(target=_build, daemon=True)
+    builder.start()
+    try:
+        with sync_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            # Bounded: without the guard, DROP INDEX CONCURRENTLY would wait on the builder forever.
+            conn.execute(text("SET lock_timeout = '3s'"))
+            deadline = time.monotonic() + 10
+            while (pid := mig._build_in_progress(conn, name)) is None:
+                assert time.monotonic() < deadline, "the concurrent build never showed in pg_stat_progress_create_index"
+                time.sleep(0.05)
+            assert mig._index_valid(conn, name) is False
+            with pytest.raises(RuntimeError, match=f"index build in progress \\(pid {pid}\\)"):
+                mig._build_index_concurrently(conn, name, ddl)
+            assert mig._index_valid(conn, name) is False, "the in-progress index was dropped"
+    finally:
+        blocker_tx.rollback()
+        blocker.close()
+        builder.join(30)
+        with sync_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text(f"DROP INDEX IF EXISTS public.{name}"))
+    assert not builder.is_alive(), "the concurrent build did not finish after the lock was released"
+    assert errors == []
