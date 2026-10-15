@@ -298,3 +298,19 @@ def test_kb_documents_by_date_docstring_mentions_email_namespace():
 
     desc = (kb_documents_by_date.__doc__ or "").lower()
     assert "email.from_address" in desc
+
+
+def test_kb_find_all_docstring_says_brief_rows_carry_a_snippet():
+    """#820: the model must know brief results carry a passage it can triage from."""
+    from harbor_clerk.search import _FIND_ALL_SNIPPET_MAX_CHARS
+
+    d = _doc(kb_find_all)
+    assert "snippet" in d
+    assert "triage" in d
+    assert f"at most {_FIND_ALL_SNIPPET_MAX_CHARS} characters" in " ".join(d.split())
+    # The Response section names the field.
+    assert "snippet (brief)" in d
+    # Triage only: read the passage before quoting it.
+    assert "kb_read_passages" in d and "source.chunk_id" in d
+    # ...qualified for keys: it needs the read tier, and a capped key reads back the same prefix.
+    assert "read-tier" in d and "up to the key's cap" in " ".join(d.split())

@@ -34,7 +34,14 @@ from harbor_clerk.models import (
     IngestionJob,
 )
 from harbor_clerk.oauth import validate_access_token as validate_oauth_access_token
-from harbor_clerk.search import FindAllHit, FindAllResult, SearchHit, SearchResult, find_all, hybrid_search
+from harbor_clerk.search import (
+    FindAllHit,
+    FindAllResult,
+    SearchHit,
+    SearchResult,
+    find_all,
+    hybrid_search,
+)
 from harbor_clerk.source_ref import (
     SourceRef,
     SourceRefContext,
@@ -758,10 +765,12 @@ def _source_ref_for_search_hit(
 
 
 def _source_ref_for_find_all_hit(hit: FindAllHit, source_context: SourceRefContext | None) -> SourceRef:
+    # full: the top chunk; brief: the chunk the snippet was cut from (none when the snippet is omitted).
+    chunk_id = hit.top_chunk_id or hit.snippet_chunk_id
     if source_context is not None:
         source_ref = source_context.ref_for_doc(
             hit.doc_id,
-            chunk_id=hit.top_chunk_id,
+            chunk_id=chunk_id,
             pages=hit.page_range,
             section=hit.top_chunk_heading,
         )
@@ -770,7 +779,7 @@ def _source_ref_for_find_all_hit(hit: FindAllHit, source_context: SourceRefConte
     return _fallback_source_ref(
         doc_id=hit.doc_id,
         doc_title=hit.doc_title,
-        chunk_id=hit.top_chunk_id,
+        chunk_id=chunk_id,
         pages=hit.page_range,
         section=hit.top_chunk_heading,
     )
@@ -1160,9 +1169,19 @@ async def kb_find_all(
       max_results: cap on documents returned (default 100; server clamps
         at settings.find_all_max_results_cap, default 500).
       offset: pagination offset over the sorted result set. Default 0.
-      presentation: "brief" (default; title + score + page range, no chunk
-        text) or "full" (adds the top chunk text per doc; clamps
-        max_results to 30 to keep the payload bounded).
+      presentation: "brief" (default; title + score + page range + a
+        snippet: the passage that earned the doc its score, at most 240
+        characters, centred on text_contains when given) or "full" (the
+        whole top chunk per doc instead; clamps max_results to 30 to keep
+        the payload bounded). A brief snippet is for triage: it lets you
+        pick which documents in a long list bear on the question without
+        reading each one. Before quoting it in an answer, read the passage
+        with kb_read_passages(chunk_ids=[the row's source.chunk_id]) and
+        cite the row's citation. kb_read_passages needs a read-tier key.
+        Under a key with a snippet cap, the snippet is the chunk's first
+        characters (not a window on text_contains), and reading the
+        passage returns the chunk's first characters, up to the key's cap
+        (as does presentation "full").
       sort_by: "relevance" (default, by max chunk score per doc),
         "date_desc" (newest first by ingested_at), or "date_asc".
 
@@ -1181,7 +1200,9 @@ async def kb_find_all(
 
     Response:
       results: list of {doc_id, doc_title, mime_type, language, score,
-        ingested_at, page_range, top_chunk (if presentation=full)}
+        ingested_at, page_range, source, citation, and snippet (brief) or
+        top_chunk {chunk_id, text, page, heading} (full)}; source.chunk_id
+        is the snippet's chunk (brief) or the top chunk (full)
       total_matches: total docs matching (post-dedupe, scope-aware)
       returned: len(results)
       offset: echoed back
@@ -1294,6 +1315,8 @@ async def kb_find_all(
             mime_type=mime_type,
             metadata_filter=metadata_filter,
             presentation=presentation,
+            # A capped key's snippet is the chunk's prefix within its max_snippet_chars.
+            key_max_snippet_chars=principal.key_scope.max_snippet_chars if principal.key_scope else None,
         )
         source_context = await _source_context(session, [h.doc_id for h in result.hits])
 
@@ -1319,6 +1342,8 @@ async def kb_find_all(
                 "page": h.top_chunk_page,
                 "heading": h.top_chunk_heading,
             }
+        elif h.snippet is not None:
+            hit["snippet"] = h.snippet
         results.append(hit)
 
     resp: dict = {

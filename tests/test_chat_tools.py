@@ -337,3 +337,14 @@ def test_the_system_prompt_sends_chronological_questions_to_documents_by_date():
         "The one exception" in SYSTEM_PROMPT[rule : rule + 500]
         and "documents_by_date" in SYSTEM_PROMPT[rule : rule + 500]
     )
+
+
+def test_find_all_documents_presentation_says_brief_rows_may_carry_a_snippet():
+    """#820: the chat model is told brief rows may carry a passage, for triage, to read before quoting.
+    "may": chat's per-result cut drops the snippets before any row (llm/chat.py)."""
+    from harbor_clerk.llm.tools import get_chat_tools
+
+    fa = next(t for t in get_chat_tools(model=None) if t["function"]["name"] == "find_all_documents")
+    desc = fa["function"]["parameters"]["properties"]["presentation"]["description"]
+    assert "may carry a short snippet" in desc
+    assert "triage" in desc and "read_passages" in desc and "'full'" in desc

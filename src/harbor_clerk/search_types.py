@@ -53,6 +53,10 @@ class FindAllHit:
     top_chunk_text: str | None  # for presentation="full"
     top_chunk_page: int | None
     top_chunk_heading: str | None
+    # presentation="brief": a bounded one-line excerpt of the best chunk,
+    # centred on text_contains when given (search._brief_snippet).
+    snippet: str | None = None
+    snippet_chunk_id: str | None = None  # the chunk the snippet was cut from
 
 
 @dataclass
