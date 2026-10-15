@@ -199,6 +199,61 @@ def test_a_list_is_scored_by_f1_so_that_recall_shows():
         score({"kind": "essay"}, "x")
 
 
+ID_STAAR = "ebbbd23d-3b0c-4c0d-a8c8-ac81198f6105"
+ID_EDIETS = "9311d183-07d1-41f4-8cd9-3cbfc712769c"
+ID_ELSEWHERE = "d60be7c8-b461-466c-beb3-b6f39fb77778"
+DOC_IDS = {ID_STAAR: STAAR, ID_EDIETS: EDIETS, ID_ELSEWHERE: "Other_20000101_10-K_EX-10.1_9_EX-10.1_Lease", "7": ACME_A}
+
+
+def test_a_contract_is_named_by_its_document_id_when_the_map_resolves_it():
+    """bench-20261014-2328-cuad-fable: "SteelVault Corp – Equidata Marketing Affiliate Agreement (doc_id
+    `ebbbd23d-…`)", never the filename stem; four of six lists scored 0 named. The map is the citations the
+    answer's tools returned, read only for the ids the answer wrote out."""
+    by_id = f"Two contracts: **SteelVault – Equidata** (doc_id `{ID_STAAR}`) and Women.com (`{ID_EDIETS}`, p. 13)."
+    assert named_contracts(by_id, UNIVERSE, None, DOC_IDS) == {STAAR, EDIETS}
+    assert named_contracts(by_id, UNIVERSE) == set(), "without the map the ids are noise, as before"
+    # An id the map does not hold names nothing; one mapped to a title outside the universe names nothing.
+    assert named_contracts("see `c84261cc-ee5f-40e3-aa1f-ff43b0d29574`", UNIVERSE, None, DOC_IDS) == set()
+    assert named_contracts(f"see `{ID_ELSEWHERE}`", UNIVERSE, None, DOC_IDS) == set()
+    # Read as a title is: hyphens may go, and a short id is too likely to be a page number or a count.
+    assert named_contracts(ID_STAAR.replace("-", ""), UNIVERSE, None, DOC_IDS) == {STAAR}
+    assert named_contracts(f"see `{ID_STAAR[:13]}…`", UNIVERSE, None, DOC_IDS) == set(), "a truncated id never resolves"
+    assert named_contracts("7 contracts, see p. 7", UNIVERSE, None, DOC_IDS) == set()
+    # Titles and filers keep working beside the map, and the map adds to them.
+    assert named_contracts(f"Staar Surgical Company; and `{ID_EDIETS}`", UNIVERSE, None, DOC_IDS) == {STAAR, EDIETS}
+    assert named_contracts(f"| *{EDIETS}* |", UNIVERSE, None, DOC_IDS) == {EDIETS}
+    assert named_contracts("", UNIVERSE, None, DOC_IDS) == set() and named_contracts(by_id, UNIVERSE, None, {}) == set()
+    # Negation is not read, for an id as for a title: the rule's stated cost.
+    assert named_contracts(
+        f"Not included: `{ID_EDIETS}` (the word appears only in warranties)", UNIVERSE, None, DOC_IDS
+    ) == {EDIETS}
+
+
+def test_a_list_scored_with_the_map_counts_an_item_named_by_id_and_without_it_scores_as_before():
+    entry = {"kind": "list", "positives": [STAAR, EDIETS, ACME_A], "universe": UNIVERSE}
+    text = f"`{ID_STAAR}` and `{ID_EDIETS}` and `{ID_ELSEWHERE}`."
+    with_map = score(entry, text, DOC_IDS)
+    assert (with_map["named"], with_map["right"], with_map["precision"], with_map["recall"]) == (2, 2, 1.0, 0.667)
+    assert with_map["score"] == pytest.approx(0.8)
+    assert score(entry, text) == score(entry, text, None) and score(entry, text)["score"] == 0.0
+    # A fact is not a list: the map is accepted and changes nothing.
+    assert score({"kind": "fact", "all_of": [["Texas"]]}, "Texas law.", DOC_IDS)["score"] == 1.0
+
+
+def test_the_map_is_read_from_a_responses_citations_at_either_level_and_from_nothing_else():
+    from scripts.test_corpora.runner.answer_key import titles_by_doc_id
+
+    citations = [
+        {"doc_id": ID_STAAR, "doc_title": STAAR, "pages": "3-4"},
+        {"source": {"doc_id": ID_EDIETS, "doc_title": EDIETS}, "score": 0.7},
+        {"doc_id": ID_ELSEWHERE},  # no title: nothing to resolve to
+        {"source": {"doc_title": ACME_A}},  # no id: nothing an answer could write
+        "a bare id from an older response",
+    ]
+    assert titles_by_doc_id(citations) == {ID_STAAR: STAAR, ID_EDIETS: EDIETS}
+    assert titles_by_doc_id(None) == {} and titles_by_doc_id([]) == {}
+
+
 def test_names_in_questions_and_years_in_keys():
     assert cuad_key.display_name(STAAR) == "Staar Surgical Company Distributor Agreement"
     assert cuad_key.display_name(EDIETS) == "Ediets Com Inc Co-Branding Agreement"
@@ -321,6 +376,25 @@ def test_the_metrics_cell_is_the_keys_score_or_empty_without_a_key():
     # An outage is not a wrong answer: the judge columns of that row are blank, and so is this one.
     assert key_score_cell(fact, None, Status.ERROR) == "" and key_score_cell(fact, {"answer": "Texas"}, None) == ""
     assert key_score_cell(None, result, Status.DONE) == "" and key_score_cell({}, result, Status.DONE) == ""
+
+
+def test_the_metrics_cell_resolves_a_document_id_the_answer_wrote_through_the_responses_citations():
+    """The phase-4 site of the rule: the response's citations are the map, at either level the app writes them,
+    and a citation the answer does not write out is still a retrieval hit, not a name."""
+    from scripts.test_corpora.runner.state import Status
+    from scripts.test_corpora.runner.sweep import key_score_cell
+
+    entry = {"kind": "list", "positives": [STAAR, EDIETS], "universe": UNIVERSE}
+    citations = [
+        {"doc_id": ID_STAAR, "doc_title": STAAR},
+        {"source": {"doc_id": ID_EDIETS, "doc_title": EDIETS}},
+        {"source": {"doc_id": ID_ELSEWHERE, "doc_title": ACME_A}},
+    ]
+    result = {"answer": f"Two: `{ID_STAAR}` and `{ID_EDIETS}`.", "citations": citations}
+    assert key_score_cell(entry, result, Status.DONE) == "1.000"
+    assert key_score_cell(entry, {**result, "citations": []}, Status.DONE) == "0.000", "no map, no names"
+    three = {**result, "answer": f"`{ID_STAAR}`, `{ID_EDIETS}` and `{ID_ELSEWHERE}`."}
+    assert key_score_cell(entry, three, Status.DONE) == "0.800", "the third id names Acme, which is not labelled"
 
 
 # ── the synthetic key's kinds: counts, amounts, both languages (#779's pairs measured against a key) ──
@@ -575,3 +649,90 @@ def test_a_list_item_is_also_named_by_an_alias_between_word_boundaries(_no_corpu
     entry = {"kind": "list", "positives": ["0001_invoice", "0012_invoice"], "universe": universe, "aliases": aliases}
     assert score(entry, table)["score"] == pytest.approx(0.8), "two right of three named, of two labelled"
     assert score({**entry, "aliases": None}, table)["score"] == 0.0, "without aliases, only a stem names an invoice"
+
+
+def test_an_item_under_a_heading_or_lead_in_that_marks_exclusion_is_not_named():
+    """The four shapes the cloud subjects wrote (bench-20261014-2328-cuad-fable keys 16, 18 and 20;
+    bench-20261015-0011-cuad-astra key 16), with the test universe's contracts in place of theirs."""
+    from scripts.test_corpora.runner.answer_key import without_excluded_sections
+
+    # Fable key-16: a `##` heading whose section is one bold item.
+    false_positive = (
+        f"## Explicit, mutual non-disparagement clauses (1)\n\n**1. Staar – Distributor** (doc_id `{ID_STAAR}`, p. 3)\n\n"
+        f"## False positive (excluded)\n\n**eDiets / Women.com – Co-Branding Agreement** (doc_id `{ID_EDIETS}`, "
+        "pp. 13–14) — the word appears only in content warranties.\n"
+    )
+    assert named_contracts(false_positive, UNIVERSE, None, DOC_IDS) == {STAAR}
+    # Fable key-18: bulleted items under a hedged heading, then a second excluded section.
+    borderline = (
+        f"## Contracts with an operative right of first refusal\n\n- **Staar** (`{ID_STAAR}`), §4\n\n"
+        "## Mentions / borderline (included for completeness, not operative ROFRs in the document itself)\n\n"
+        f"- **Women.com** (`{ID_EDIETS}`), §9.1(d) — a cross-reference to the separate Franchise Agreement.\n\n"
+        f'## Reviewed and excluded\n"First right" hits that are enforcement priorities: {EDIETS}.\n'
+    )
+    assert named_contracts(borderline, UNIVERSE, None, DOC_IDS) == {STAAR}
+    # Fable key-20: a near-miss heading, and a heading after it that is kept (the drop ends there).
+    near_miss = (
+        f"## Contracts governed by Delaware law — 1 found\n\n- **Staar** (`{ID_STAAR}`)\n\n"
+        f"## Near-miss worth flagging (not Delaware-governed)\n\n- **Women.com** (`{ID_EDIETS}`): New York law.\n\n"
+        f"## Method / caveats\n\nThe {EDIETS} hit above was read in full.\n"
+    )
+    assert named_contracts(near_miss, UNIVERSE, None, DOC_IDS) == {STAAR, EDIETS}, "the caveats section is kept"
+    # astra key-16: a bold lead-in with the item on its own line, after a table that is kept.
+    not_counted = (
+        "### Contracts containing non-disparagement restrictions\n\n| Contract | Provision |\n|---|---|\n"
+        f"| **[STAAR Surgical Company — Distributor Agreement](doc_id:{ID_STAAR})** | §6.7 |\n\n"
+        f"**One additional keyword match, not counted above:** [eDiets.com](doc_id:{ID_EDIETS}), content warranties.\n\n"
+        "I searched the corpus for the stem **“disparag”**.\n"
+    )
+    assert named_contracts(not_counted, UNIVERSE, None, DOC_IDS) == {STAAR}
+    # Mid-line bold is not a lead-in, so the excluded lead-in's drop runs over the trailing prose to the end...
+    assert "searched the corpus" not in without_excluded_sections(not_counted)
+    # ...and ends at the next heading or lead-in.
+    assert "searched the corpus" in without_excluded_sections(
+        not_counted.replace("I searched", "### Method\nI searched")
+    )
+    assert "searched the corpus" in without_excluded_sections(
+        not_counted.replace("I searched", "**Method:** I searched")
+    )
+    # A heading that does not mark exclusion keeps its section, with the words the patterns must not over-read.
+    kept = f"## Contracts with the clause\n\n- {STAAR}\n\n## Exclusive license grants (2)\n\n- `{ID_EDIETS}`\n"
+    assert named_contracts(kept, UNIVERSE, None, DOC_IDS) == {STAAR, EDIETS}
+    assert named_contracts(
+        f"## No. 2: {STAAR}\n**Perpetual only (not described as irrevocable)**\n`{ID_EDIETS}`", UNIVERSE, None, DOC_IDS
+    ) == {STAAR, EDIETS}
+    # A bare "no" is not a marker: on the real data it dropped only a section holding a labelled contract, and
+    # these headings are not rejects.
+    no_but_kept = (
+        f"Found two.\n\n## Contracts governed by Delaware law — no exceptions\n`{ID_STAAR}`\n\n"
+        f"## Disparagement as a termination trigger only — no affirmative covenant (1)\n`{ID_EDIETS}`\n\n"
+        f"## Matches (no duplicates)\n{ACME_A}\n"
+    )
+    assert named_contracts(no_but_kept, UNIVERSE, None, DOC_IDS) == {STAAR, EDIETS, ACME_A}
+
+
+def test_a_dropped_heading_takes_its_sub_headings_and_lead_ins_and_the_first_section_is_never_dropped():
+    from scripts.test_corpora.runner.answer_key import without_excluded_sections
+
+    text = (
+        f"Found one.\n\n## Matches\n\n### 1. Staar\n`{ID_STAAR}`\n\n## Reviewed and excluded\n\n### 1. Women.com\n"
+        f"`{ID_EDIETS}`\n\n**Also:** {ACME_A}\n\n## Summary\n\nOne contract: Staar Surgical Company.\n"
+    )
+    assert named_contracts(text, UNIVERSE, None, DOC_IDS) == {STAAR}
+    assert without_excluded_sections(text).endswith("## Summary\n\nOne contract: Staar Surgical Company.")
+    # A lead-in's section ends at the next lead-in or heading; a heading's does not end at a lead-in.
+    assert named_contracts(f"**Not a match:** `{ID_EDIETS}`\n**Match:** `{ID_STAAR}`\n", UNIVERSE, None, DOC_IDS) == {
+        EDIETS,
+        STAAR,
+    }, "the first section is never dropped, even when it opens with a marked lead-in"
+    assert named_contracts(
+        f"Two.\n**Not a match:** `{ID_EDIETS}`\n**Match:** `{ID_STAAR}`\n", UNIVERSE, None, DOC_IDS
+    ) == {STAAR}
+    assert named_contracts(f"Two.\n## Excluded\n**Match:** `{ID_STAAR}`\n", UNIVERSE, None, DOC_IDS) == set()
+    # Negation in prose is still not read: the rule reads headings and lead-ins only.
+    assert named_contracts(f"Not included: `{ID_EDIETS}` (warranties only)", UNIVERSE, None, DOC_IDS) == {EDIETS}
+    # The shape it cannot read, stated as a cost in the module docstring: an excluded lead-in followed by `###`
+    # items excludes only itself, because a heading ends a lead-in's section.
+    unread = f"Found one: `{ID_STAAR}`.\n\n**Not counted:**\n### 1. Women.com\n**Doc ID:** `{ID_EDIETS}`\n"
+    assert named_contracts(unread, UNIVERSE, None, DOC_IDS) == {STAAR, EDIETS}
+    assert without_excluded_sections("") == "" and without_excluded_sections("plain answer") == "plain answer"

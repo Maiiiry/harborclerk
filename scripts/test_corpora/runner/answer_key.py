@@ -8,7 +8,27 @@ names 23 of 65 anti-assignment contracts looks complete to every judge.
 The labels are the annotators' or the generator's. Everything else here is this harness's and is crude on purpose,
 so that it can be read: a fact is present or it is not; a list is the F1 of the items an answer names in its text
 against the items labelled. What counts as "naming" an item is the weakest part, and `named_contracts` says exactly
-what it does, and what it deliberately ignores. The fact matcher accepts negation ("New York law, not Delaware" finds
+what it does, and what it deliberately ignores. An answer may also name an item by its document id: a scoring site
+passes `doc_ids`, the id -> title map built from the citations the answer's tools returned, and an id written in
+the text that maps to a universe title names that item (a cloud model writes "SteelVault - Equidata Affiliate
+Agreement (doc_id `ebbbd23d-...`)" and never the filename stem the key holds; bench-20261014-2328-cuad-fable scored
+four such lists at 0 named). The citations themselves are still not counted: the map is a dictionary for the ids
+the answer wrote out, nothing more. A list answer's sections are read before its items are: a cloud subject puts
+what it rejected under its own heading ("## False positive (excluded)", "## Near-miss worth flagging (not
+Delaware-governed)", "## Mentions / borderline (included for completeness, not operative ROFRs ...)") or bold
+lead-in ("**One additional keyword match, not counted above:**"), and an item named there, by id, title or filer,
+is not named (`without_excluded_sections`). A heading (`#` line) or a bold lead-in (`**...**` opening a line)
+marks exclusion when its own text, accents folded, contains "excluded", "exclusion(s)", "excludes", "not counted",
+"not included", "not a match", "non-match", "near-miss", "borderline", "false positive", "not operative" or "does
+not": the phrasings observed in cloud subjects' answers, in English only (a French answer's "exclus" is not read; no
+keyed list question is asked in French). A bare "no" is not one of them: on the real data it dropped only a
+section holding a labelled contract ("— no affirmative covenant"), and it would drop "## Matches (no duplicates)".
+A heading's section runs to the next heading of its level or higher, so its sub-headings and lead-ins go with it; a
+lead-in's runs to the next lead-in or heading; the answer's first section is never dropped. The costs, accepted: a
+genuinely matching item listed under a hedged heading is lost (on bench-20261014-2328-cuad-fable, a labelled
+contract under "Mentions / borderline"); an item rejected in running prose ("X is not one") is still counted; and a
+lead-in followed by `###` items ("**Not counted:**", then "### 1. Rand") excludes nothing but itself, because a
+heading ends a lead-in's section. The fact matcher accepts negation ("New York law, not Delaware" finds
 "Delaware"); a key is one phrase, so this has not mattered yet, and is stated so that a score of 1.0 is read as
 "the phrase is present", nothing more. The one thing read before the phrase is looked for is the answer's opening
 sentence: one that contains a "found nothing" phrasing ("is not explicitly stated in the retrieved excerpts", then
@@ -192,19 +212,75 @@ def company(title: str) -> str:
     return normalize(title.split("_")[0])
 
 
-def named_contracts(text: str, universe: list[str], aliases: dict[str, list[str]] | None = None) -> set[str]:
+# A markdown heading: one to six `#`, then its text. A bold lead-in: `**...**` opening a line. A numbered item written
+# bold ("**1. Staar – Distributor** (doc_id ...)") opens its line bold and so is a lead-in of its own, which is
+# benign: its section is itself, to the next lead-in or heading, and its own text is a name, not a marker. A
+# bulleted one ("- **Staar**") is not a lead-in. What marks a section as the answer's rejects, read in its heading's
+# or lead-in's own text only, lower-cased and accents folded, English only; the module docstring lists them in words.
+_HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*?)[ \t#]*$")
+_BOLD_LEAD = re.compile(r"^[ \t]*\*\*([^*\r\n]+?)\*\*")
+_EXCLUSION = re.compile(
+    r"\bexclu(?:ded|sions?|des)\b|\bnot (?:counted|included|a match|operative)\b|\bnon-?match|\bnear-?miss"
+    r"|\bborderline\b|\bfalse positives?\b|\bdoes not\b"
+)
+_LEAD_IN_LEVEL = 7  # below any heading: a heading's section takes its lead-ins with it, not the other way round
+
+
+def without_excluded_sections(text: str) -> str:
+    """`text` without the sections its headings or bold lead-ins mark as rejected (`_EXCLUSION`): the marked line
+    and everything to the next heading of the same or a higher level (for a heading) or to the next lead-in or
+    heading (for a lead-in). The first section, with or without a heading, is never dropped: an answer that opens
+    with its rejects is not an answer this rule can read, and it is left whole rather than emptied."""
+    kept: list[str] = []
+    dropping: int | None = None  # the level of the section being dropped
+    first = True  # nothing kept yet: the section about to open is the answer's first
+    for line in text.splitlines():
+        heading, lead = _HEADING.match(line), _BOLD_LEAD.match(line)
+        if heading or lead:
+            level = len(heading.group(1)) if heading else _LEAD_IN_LEVEL
+            label = heading.group(2) if heading else lead.group(1)
+            if dropping is not None and level <= dropping:
+                dropping = None
+            if dropping is None and not first and _EXCLUSION.search(fold(label).lower()):
+                dropping = level
+        if line.strip():
+            first = False
+        if dropping is None:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def named_contracts(
+    text: str,
+    universe: list[str],
+    aliases: dict[str, list[str]] | None = None,
+    doc_ids: dict[str, str] | None = None,
+) -> set[str]:
     """Which items of `universe` an answer names, in its text: an item is named if its whole title appears, or if
     its filer's name appears and that filer has exactly one contract in the universe and a name of eight
     characters or more, or if one of its `aliases` appears: a word alias between word boundaries, a numeric alias
-    as a number the answer states, to the value ("$1,200.80" does not state 20080; review of #812). The synthetic
-    key names an invoice by its file stem and aliases it by its invoice number and its total, where unique in the
-    corpus; `corpora/synthetic_key.py` says which. It misses an item referred to only by paraphrase ("the Papa
-    John's deal") and cannot tell an item listed as a match from one listed as a non-match.
+    as a number the answer states, to the value ("$1,200.80" does not state 20080; review of #812), or if its
+    document id appears and `doc_ids` maps that id to its title. The synthetic key names an invoice by its file
+    stem and aliases it by its invoice number and its total, where unique in the corpus; `corpora/synthetic_key.py`
+    says which. The text is read without the sections the answer itself marks as rejected (a heading or bold
+    lead-in saying "excluded", "not counted", "near-miss" and the like; `without_excluded_sections` has the whole
+    list), so an item under "## False positive (excluded)" is not named, however it is named there. It misses an
+    item referred to only by paraphrase ("the Papa John's deal"), and in running prose it still cannot tell a
+    match from a non-match: "not included: `ebbb...`" in a sentence names that item as a title there would.
 
-    The answer's `citations` are deliberately not consulted. The app's citations field is every hit any tool
-    call returned (`dedupe_citations(citations_accumulated)` in llm/chat.py: a median of 20 and up to 65 per
+    `doc_ids` is document id -> title, built by the scoring site from the citations the answer's tools returned
+    (`titles_by_doc_id` for a phase-4 response; a baseline's `cited_doc_ids` zipped with its `cited_doc_titles`).
+    An id is read as a title is, squeezed to letters and digits, and the whole of it must appear: the eight-character
+    floor is on the map's id, not a licence for partial matching, so a truncated id in the answer ("ebbbd23d-…")
+    never resolves. An id the map does not hold, or one mapped to a title outside the universe, names nothing. Without the map a cloud model's
+    list, which writes the parties and the id and never the filename stem, scored 0 named (2026-10-14).
+
+    The answer's `citations` are otherwise deliberately not consulted. The app's citations field is every hit any
+    tool call returned (`dedupe_citations(citations_accumulated)` in llm/chat.py: a median of 20 and up to 65 per
     list answer here), not what the answer refers to. Counting them would score search volume, and an answer
-    saying "none" after one search would score like one that listed the hits (review of #697)."""
+    saying "none" after one search would score like one that listed the hits (review of #697). The map only
+    resolves ids the answer itself wrote out."""
+    text = without_excluded_sections(text)
     squeezed, words = normalize(text), _words(text)
     amounts = amounts_in(text) if aliases else set()
     filers: dict[str, list[str]] = {}
@@ -217,7 +293,39 @@ def named_contracts(text: str, universe: list[str], aliases: dict[str, list[str]
         by_alias = any(_mentions(words, amounts, alias) for alias in (aliases or {}).get(title, ()))
         if whole in squeezed or by_filer or by_alias:
             found.add(title)
+    return found | _named_by_id(squeezed, universe, doc_ids)
+
+
+def _named_by_id(squeezed: str, universe: list[str], doc_ids: dict[str, str] | None) -> set[str]:
+    """The universe titles whose document id, as `doc_ids` maps it, is written in the answer (`squeezed` is the
+    answer as `normalize` leaves it, so `ebbbd23d-3b0c-...` and `ebbbd23d3b0c...` are one id)."""
+    if not doc_ids:
+        return set()
+    by_title = {normalize(title): title for title in universe}
+    found = set()
+    for doc_id, title in doc_ids.items():
+        squeezed_id = normalize(str(doc_id or ""))
+        if len(squeezed_id) >= 8 and squeezed_id in squeezed and (hit := by_title.get(normalize(str(title or "")))):
+            found.add(hit)
     return found
+
+
+def titles_by_doc_id(citations: Iterable | None) -> dict[str, str]:
+    """The `doc_ids` map for `named_contracts` from a phase-4 response's `citations`, as the app returns them: each
+    a dict with `doc_id` and `doc_title`, or carrying both under `source`. A citation without both says nothing,
+    and a citation that is not a dict (an older response's bare id) says nothing either."""
+    out: dict[str, str] = {}
+    for citation in citations or ():
+        if not isinstance(citation, dict):
+            continue
+        source = citation.get("source")
+        if not isinstance(source, dict):
+            source = {}
+        doc_id = citation.get("doc_id") or source.get("doc_id")
+        title = citation.get("doc_title") or source.get("doc_title")
+        if doc_id and title:
+            out[str(doc_id)] = str(title)
+    return out
 
 
 def mentions(text: str, alias: str) -> bool:
@@ -454,12 +562,14 @@ def refuse_foreign_keys(keys_by_corpus: dict[str, dict], corpora: Iterable[str],
             check_generation(header["generation"], header.get("corpus", corpus))
 
 
-def score(entry: dict, answer: str) -> dict:
+def score(entry: dict, answer: str, doc_ids: dict[str, str] | None = None) -> dict:
     """{"score": 0..1, ...detail}. An empty answer scores 0, and so does a fact, date, count or amount answer whose
     opening sentence says the thing is absent, before its text is searched (#713). "Absent" is any of quality.py's
     no-findings phrasings: the ones the baseline check reads anywhere ("no information about ...") and the ones
     read only in an opening, in English and French. An entry that names its corpus generation is first checked
-    against the corpus under the workdir (`check_generation`)."""
+    against the corpus under the workdir (`check_generation`). `doc_ids` (document id -> title, from the answer's
+    citations) lets a list answer name an item by its id; see `named_contracts`. Without it, titles, filers and
+    aliases are read as before."""
     answer = answer or ""
     kind = entry["kind"]
     if generation := entry.get("generation"):
@@ -488,7 +598,7 @@ def score(entry: dict, answer: str) -> dict:
         return {"score": 1.0 if _has_amount(answer, entry["amount"]) else 0.0}
     if kind == "list":
         want = set(entry["positives"])
-        got = named_contracts(answer, entry["universe"], entry.get("aliases"))
+        got = named_contracts(answer, entry["universe"], entry.get("aliases"), doc_ids)
         right = len(want & got)
         precision = right / len(got) if got else 0.0
         recall = right / len(want) if want else 0.0
