@@ -146,6 +146,7 @@ def test_a_question_makes_a_bounded_number_of_model_calls_and_the_last_has_no_to
     assert not any(ANSWER_NOW in str(c.kwargs["messages"]) for c in calls[:-1])
     assert res.answer == "what I have so far"
     assert res.stopped_by == "model_call_limit", "a reference cut short must say so"
+    assert res.model_call_count == MAX_MODEL_CALLS, "what the report's calls column sums"
 
 
 def test_a_question_that_finishes_on_its_own_says_so():
@@ -155,6 +156,7 @@ def test_a_question_that_finishes_on_its_own_says_so():
     fake.messages.create.return_value = MagicMock(content=[MagicMock(text="done", type="text")], stop_reason="end_turn")
     res = BaselineGenerator(client=fake, mcp_session=None).run_question(question="q", question_id="q1", corpus="cuad")
     assert fake.messages.create.call_count == 1 and res.stopped_by == "end_turn"
+    assert res.model_call_count == 1
     assert "tool_choice" not in fake.messages.create.call_args.kwargs
 
 
@@ -227,3 +229,20 @@ def test_a_spend_kind_nobody_priced_is_refused_when_the_provider_is_built():
     for provider in (AnthropicProvider, OpenAIProvider):
         with pytest.raises(ValueError, match="cannot be planned for"):
             provider(mcp_session=None, spend_kind="baseline")
+
+
+def test_a_model_whose_thinking_is_always_on_gets_room_for_it_in_max_tokens():
+    """Review of #811: max_tokens covers the thinking as well as the answer on Fable 5.1 and Opus 5.5, and a call
+    that thinks past 8,000 returns stop_reason max_tokens with no text: an empty reference, a subject scored 0."""
+    from unittest.mock import MagicMock
+
+    from scripts.test_corpora.runner.providers.anthropic_provider import MAX_TOKENS, MAX_TOKENS_WITH_THINKING
+
+    for model, limit in (("claude-sonnet-4-6", MAX_TOKENS), ("claude-fable-5-1", MAX_TOKENS_WITH_THINKING)):
+        fake = MagicMock()
+        fake.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="a", type="text")], stop_reason="end_turn"
+        )
+        BaselineGenerator(client=fake, mcp_session=None, model=model).run_question("q", "q", "c")
+        assert fake.messages.create.call_args.kwargs["max_tokens"] == limit, model
+    assert (MAX_TOKENS, MAX_TOKENS_WITH_THINKING) == (8000, 16000)
