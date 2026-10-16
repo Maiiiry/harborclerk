@@ -171,6 +171,9 @@ def test_0008_downgrade_rebuilds_an_invalid_leftover_index(alembic_cfg, sync_eng
     mig = _load_0008()
     command.upgrade(alembic_cfg, "head")
     try:
+        # Seeded at 0008, where an interrupted 0008 downgrade leaves it: 0009's downgrade rewrites the
+        # table, and a rewrite rebuilds every index, which would make a leftover seeded at head valid.
+        command.downgrade(alembic_cfg, "0008_chunk_text_ws_fold")
         _seed_invalid_index(sync_engine, mig.PLAIN_INDEX)
 
         command.downgrade(alembic_cfg, "0007_ingestion_job_pipeline_seq")
@@ -227,8 +230,17 @@ def test_0008_refuses_a_fold_function_with_a_different_definition(alembic_cfg, s
             command.upgrade(alembic_cfg, "head")
     finally:
         # Robust even if the check regressed and an index was built on the wrong body: drop both,
-        # restamp, rebuild from the real definition.
+        # restamp, rebuild from the real definition. If the regression let the run reach 0009, the
+        # FTS columns depend on the function too, and CASCADE would drop them: reset them to
+        # 0001's expressions first (a no-op rewrite at 0007).
         with sync_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE public.chunks "
+                    "ALTER COLUMN fts_en SET EXPRESSION AS (to_tsvector('english', coalesce(chunk_text, ''))), "
+                    "ALTER COLUMN fts_fr SET EXPRESSION AS (to_tsvector('french', coalesce(chunk_text, '')))"
+                )
+            )
             conn.execute(text("DROP FUNCTION IF EXISTS public.hc_fold_whitespace(text) CASCADE"))
         command.stamp(alembic_cfg, "0007_ingestion_job_pipeline_seq")
         command.upgrade(alembic_cfg, "head")
@@ -334,3 +346,253 @@ def test_0008_does_not_drop_an_index_whose_build_is_still_running(sync_engine):
             conn.execute(text(f"DROP INDEX IF EXISTS public.{name}"))
     assert not builder.is_alive(), "the concurrent build did not finish after the lock was released"
     assert errors == []
+
+
+def _fts_expressions(engine) -> dict[str, str]:
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attribute a "
+                "JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+                "WHERE a.attrelid = 'public.chunks'::regclass AND a.attname IN ('fts_en', 'fts_fr')"
+            )
+        )
+        return dict(rows.all())
+
+
+def test_fts_over_folded_text_migration_round_trips(alembic_cfg, sync_engine):
+    """0009 (#825) goes down to the unfolded expressions of 0001 and back up to the folded ones."""
+    command.upgrade(alembic_cfg, "head")
+    try:
+        command.downgrade(alembic_cfg, "0008_chunk_text_ws_fold")
+        assert _fts_expressions(sync_engine) == {
+            "fts_en": "to_tsvector('english'::regconfig, COALESCE(chunk_text, ''::text))",
+            "fts_fr": "to_tsvector('french'::regconfig, COALESCE(chunk_text, ''::text))",
+        }
+    finally:
+        command.upgrade(alembic_cfg, "head")
+    assert _fts_expressions(sync_engine) == {
+        "fts_en": "to_tsvector('english'::regconfig, hc_fold_whitespace(COALESCE(chunk_text, ''::text)))",
+        "fts_fr": "to_tsvector('french'::regconfig, hc_fold_whitespace(COALESCE(chunk_text, ''::text)))",
+    }
+    names = _chunk_index_names(sync_engine)
+    assert {"chunks_fts_en_idx", "chunks_fts_fr_idx"} <= names
+
+
+def test_0009_refuses_a_fold_function_with_a_different_definition(alembic_cfg, sync_engine):
+    """The stored columns are computed with the function's body of the day, like 0008's index:
+    0009 builds only on 0008's exact definition."""
+    mig = _load_0008()
+    command.upgrade(alembic_cfg, "head")
+    try:
+        command.downgrade(alembic_cfg, "0008_chunk_text_ws_fold")
+        with sync_engine.begin() as conn:
+            conn.execute(
+                text(_variant_function_ddl("different body").replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION"))
+            )
+        with pytest.raises(RuntimeError, match="different definition"):
+            command.upgrade(alembic_cfg, "head")
+        assert "hc_fold_whitespace" not in _fts_expressions(sync_engine)["fts_en"]
+    finally:
+        with sync_engine.begin() as conn:
+            conn.execute(
+                text(
+                    mig._FUNCTION_DDL.format(name=mig.FOLD_FUNCTION).replace(
+                        "CREATE FUNCTION", "CREATE OR REPLACE FUNCTION"
+                    )
+                )
+            )
+            conn.execute(text(f"REINDEX INDEX public.{mig.FOLD_INDEX}"))
+        command.upgrade(alembic_cfg, "head")
+    assert "hc_fold_whitespace" in _fts_expressions(sync_engine)["fts_en"]
+
+
+def test_0008_guard_passes_twice_on_one_asyncpg_connection(alembic_cfg, sync_engine):
+    """The guard resolves both functions when its statement runs: asyncpg caches prepared
+    statements per connection, and a '...'::regprocedure literal resolved at prepare time made the
+    second check compare against the dropped first twin and refuse an identical function. The
+    function must already exist, or the first call creates it and never compares."""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    mig = _load_0008()
+    command.upgrade(alembic_cfg, "head")
+    assert _fold_function_exists(sync_engine)
+
+    async def _twice():
+        engine = create_async_engine(os.environ["DATABASE_URL"])
+        try:
+            async with engine.connect() as conn:
+                for _ in range(2):
+                    await conn.run_sync(mig._create_fold_function)
+                await conn.rollback()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_twice())
+
+
+def test_upgrade_from_0007_with_the_fold_function_already_present(alembic_cfg, sync_engine):
+    """0007 -> head in one run, with the function left behind by an interrupted earlier attempt
+    (0008's autocommit block commits it): 0008 and then 0009 both check it on the same connection."""
+    mig = _load_0008()
+    command.upgrade(alembic_cfg, "head")
+    try:
+        command.downgrade(alembic_cfg, "0007_ingestion_job_pipeline_seq")
+        with sync_engine.begin() as conn:
+            conn.execute(text(mig._FUNCTION_DDL.format(name=mig.FOLD_FUNCTION)))
+        command.upgrade(alembic_cfg, "head")
+    finally:
+        _restore_head(alembic_cfg, sync_engine)
+    assert "hc_fold_whitespace" in _fts_expressions(sync_engine)["fts_en"]
+    assert _index_state(sync_engine, mig.FOLD_INDEX)[0] is True
+
+
+def _activity(engine, name: str) -> tuple | None:
+    """(state, wait_event_type, wait_event, query, backend_xmin) of the backend carrying ``name``."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT state, wait_event_type, wait_event, query, backend_xmin::text FROM pg_stat_activity "
+                "WHERE application_name = :name AND datname = current_database()"
+            ),
+            {"name": name},
+        ).first()
+    return tuple(row) if row else None
+
+
+def _wait_until(predicate, what: str, seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.1)
+
+
+@pytest.mark.parametrize(
+    ("start", "blocker_mode"),
+    [
+        # The first run waits on 0009's ALTER TABLE.
+        ("0008_chunk_text_ws_fold", "ACCESS SHARE"),
+        # The first run waits inside 0008's CREATE INDEX CONCURRENTLY, which later waits for every
+        # older snapshot in the database: a second run blocked in pg_advisory_lock holds one, and
+        # waits on the lock the first run holds, so the deadlock detector killed the first run
+        # mid-build. A second run that polls with pg_try_advisory_lock outside a transaction does
+        # not hold a snapshot while it waits.
+        ("0007_ingestion_job_pipeline_seq", "ROW EXCLUSIVE"),
+    ],
+)
+def test_concurrent_runs_are_serialised_and_rewrite_once(alembic_cfg, sync_engine, start, blocker_mode):
+    """Two `alembic upgrade head` (a double click, a restart during a run): the second waits for the
+    first, without holding a snapshot or a transaction, then finds head. Without the lock both
+    queued on 0009's ALTER, rewrote chunks twice, and the second failed to stamp. The first run is
+    held on a lock on chunks until the second is waiting; an event trigger counts the rewrites."""
+    import subprocess
+
+    command.upgrade(alembic_cfg, "head")
+    command.downgrade(alembic_cfg, start)
+    with sync_engine.begin() as conn:
+        conn.execute(text("CREATE TABLE IF NOT EXISTS hc_test_rewrites (relid oid NOT NULL)"))
+        conn.execute(
+            text(
+                "CREATE OR REPLACE FUNCTION hc_test_log_rewrite() RETURNS event_trigger LANGUAGE plpgsql AS "
+                "$$ BEGIN INSERT INTO hc_test_rewrites VALUES (pg_event_trigger_table_rewrite_oid()); END $$"
+            )
+        )
+        conn.execute(
+            text("CREATE EVENT TRIGGER hc_test_rewrite ON table_rewrite EXECUTE FUNCTION hc_test_log_rewrite()")
+        )
+    first, second = "hc-test-concurrent-first", "hc-test-concurrent-second"
+    procs: list[subprocess.Popen] = []
+    blocker = sync_engine.connect()
+    blocker_tx = blocker.begin()
+
+    def _start(name: str) -> None:
+        procs.append(
+            subprocess.Popen(
+                ["alembic", "upgrade", "head"],
+                env={**os.environ, "HC_MIGRATION_APPLICATION_NAME": name},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        )
+
+    try:
+        blocker.execute(text(f"LOCK TABLE public.chunks IN {blocker_mode} MODE"))
+        _start(first)
+        _wait_until(lambda: (_activity(sync_engine, first) or (None, None))[1] == "Lock", "the first run to block")
+        _start(second)
+
+        def _second_waiting() -> bool:
+            # Blocked in a lock (pg_advisory_lock, or the same ALTER without any lock), or polling:
+            # idle between tries, its last statement the COMMIT that ends each try.
+            act = _activity(sync_engine, second)
+            return act is not None and (act[1] == "Lock" or (act[0] == "idle" and (act[3] or "").startswith("COMMIT")))
+
+        _wait_until(_second_waiting, "the second run to wait")
+        second_while_waiting = _activity(sync_engine, second)
+        blocker_tx.rollback()
+        outputs = [p.communicate(timeout=120)[0] for p in procs]
+        assert [p.returncode for p in procs] == [0, 0], [out[-800:] for out in outputs]
+        with sync_engine.connect() as conn:
+            rewrites = conn.execute(
+                text("SELECT count(*) FROM hc_test_rewrites WHERE relid = 'public.chunks'::regclass")
+            ).scalar()
+            version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        assert rewrites == 1
+        assert version == "0009_fts_over_folded_text"
+        assert _index_state(sync_engine, "ix_chunks_chunk_text_ws_trgm")[0] is True
+        # The second run polled: idle between tries (no open transaction), no lock wait, no snapshot.
+        state, wait_type, _, _, xmin = second_while_waiting
+        assert state == "idle" and wait_type != "Lock" and xmin is None, second_while_waiting
+        # ... and said who it was waiting for.
+        assert "Waiting for another migration run to finish (held by pid " in outputs[1], outputs[1][-800:]
+        assert f"application_name '{first}')" in outputs[1], outputs[1][-800:]
+    finally:
+        if blocker_tx.is_active:
+            blocker_tx.rollback()
+        blocker.close()
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait(10)
+        with sync_engine.begin() as conn:
+            conn.execute(text("DROP EVENT TRIGGER IF EXISTS hc_test_rewrite"))
+            conn.execute(text("DROP FUNCTION IF EXISTS hc_test_log_rewrite()"))
+            conn.execute(text("DROP TABLE IF EXISTS hc_test_rewrites"))
+        _drop_invalid_leftovers(sync_engine, "ix_chunks_chunk_text_ws_trgm", "ix_chunks_chunk_text_trgm")
+        command.upgrade(alembic_cfg, "head")
+
+
+def test_0009_fails_fast_when_chunks_is_held(alembic_cfg, sync_engine):
+    """On a live API another transaction may hold chunks; 0009's ALTER waits at most 10 s
+    (lock_timeout) rather than queueing every search behind it, says so, and leaves 0008 stamped."""
+    import subprocess
+
+    command.upgrade(alembic_cfg, "head")
+    command.downgrade(alembic_cfg, "0008_chunk_text_ws_fold")
+    blocker = sync_engine.connect()
+    blocker_tx = blocker.begin()
+    try:
+        blocker.execute(text("LOCK TABLE public.chunks IN ROW EXCLUSIVE MODE"))
+        started = time.monotonic()
+        # A subprocess with a bound: without the lock_timeout the ALTER would wait for the blocker
+        # forever, and this test would hang instead of failing.
+        run = subprocess.run(
+            ["alembic", "upgrade", "head"], env=dict(os.environ), capture_output=True, text=True, timeout=60
+        )
+        elapsed = time.monotonic() - started
+        assert run.returncode != 0
+        assert "could not lock public.chunks within 10s: another transaction holds it" in run.stderr, run.stderr[-800:]
+        blocker_tx.rollback()
+        with sync_engine.connect() as conn:
+            assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0008_chunk_text_ws_fold"
+        assert "hc_fold_whitespace" not in _fts_expressions(sync_engine)["fts_en"]
+        assert 9 < elapsed < 30, elapsed
+    finally:
+        if blocker_tx.is_active:
+            blocker_tx.rollback()
+        blocker.close()
+        command.upgrade(alembic_cfg, "head")
+    assert "hc_fold_whitespace" in _fts_expressions(sync_engine)["fts_en"]

@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import os
+import subprocess
+import sys
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -11,7 +14,9 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 from sqlalchemy import delete, func, select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from harbor_clerk.api.deps import Principal, require_admin
 from harbor_clerk.api.schemas.system import (
@@ -36,6 +41,9 @@ from harbor_clerk.storage import get_storage
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["system"])
+
+# The maintenance action's deadline for `alembic upgrade head`; past it the run is cancelled.
+MIGRATION_TIMEOUT_SECONDS = 120
 
 # Marker baked into every shim by CliShimInstaller.swift
 _SHIM_MARKER = "# harbor-clerk — installed by Harbor Clerk Server"
@@ -1064,42 +1072,213 @@ async def clear_queue(
 @router.post("/system/run-migrations")
 async def run_migrations(
     admin: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    """Run alembic upgrade head. Returns current schema version after completion."""
-    import asyncio
-    import subprocess
+    """Run alembic upgrade head. Returns current schema version after completion.
 
-    settings = get_settings()
+    Refuses (409) while another migration run holds the migration lock, instead of queueing a
+    second run behind it. Audited once per request with its outcome: ok, error, timeout, busy or
+    cancelled.
+    """
+    from harbor_clerk import migration_session
 
-    def _run():
-        result = subprocess.run(
-            ["python", "-m", "alembic", "upgrade", "head"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env={
-                **os.environ,
-                "DATABASE_URL": settings.database_url,
-            },
-        )
-        return result
+    # "cancelled" stays only if the request task is cancelled in-process (an asyncio cancellation:
+    # a BaseException, so not the `except Exception` below).
+    audit: dict[str, Any] = {"outcome": "cancelled", "version": None}
+    try:
+        if await migration_session.migration_lock_holder(session) is not None:
+            audit.update(outcome="busy", version=await _schema_version(session))
+            raise HTTPException(
+                status_code=409, detail="Another migration run is in progress; try again when it has finished."
+            )
+        # End this request's transaction before alembic starts (the session require_admin
+        # authenticated with, cached per request): an idle-in-transaction session holds a snapshot,
+        # and CREATE INDEX CONCURRENTLY (0008) waits for every older snapshot in the database, so
+        # alembic would wait on this very request until the deadline.
+        await session.commit()
+
+        session_name = migration_session.unique_application_name()
+        proc = _start_alembic(session_name)
+        finished = False
+        try:
+            try:
+                _stdout, stderr = await asyncio.to_thread(proc.communicate, timeout=MIGRATION_TIMEOUT_SECONDS)
+                finished = True
+            except subprocess.TimeoutExpired:
+                stop = await asyncio.shield(_stop_alembic(proc, session_name))
+                audit.update(outcome="busy" if stop.queued else "timeout", version=stop.version)
+                raise HTTPException(status_code=504, detail=_timeout_detail(stop)) from None
+        finally:
+            if not finished and proc.returncode is None:
+                # Any other way out (the request task cancelled in-process, an error): alembic must
+                # not outlive the request, nor its backend keep a lock. Shielded, so a second
+                # cancellation does not interrupt the cleanup. A client disconnect does not cancel
+                # this handler, and a forced exit (SIGKILL of the API) skips this too: the orphaned
+                # alembic then finishes on its own, and the next runner waits for its lock.
+                stop = await asyncio.shield(_stop_alembic(proc, session_name))
+                audit["version"] = stop.version
+        if proc.returncode != 0:
+            audit.update(outcome="error", version=await _schema_version(session))
+            raise HTTPException(status_code=500, detail=f"Migration failed: {(stderr or '')[-500:]}")
+
+        version = await _schema_version(session)
+        audit.update(outcome="ok", version=version)
+        return {"status": "ok", "schema_version": version}
+    except HTTPException:
+        raise
+    except Exception:
+        # Anything else that failed (alembic could not be started, the pre-check query, ...).
+        audit["outcome"] = "error"
+        raise
+    finally:
+        await asyncio.shield(_audit_run(session, admin.id, audit))
+
+
+async def _audit_run(session: AsyncSession, user_id, detail: dict[str, Any]) -> None:
+    """The run's audit row, on every path; never raises (an audit failure must not mask the outcome)."""
+    try:
+        await log_audit(session, user_id=user_id, action="run_migrations", detail=detail)
+        await session.commit()
+    except Exception:
+        logger.exception("Could not audit the migration run (%s)", detail)
+
+
+# How long the timeout path waits for the cancelled backends to exit before reporting.
+MIGRATION_CANCEL_WAIT_SECONDS = 10.0
+# Connect timeout of the dedicated connection that cancels a run.
+STOP_CONNECT_TIMEOUT_SECONDS = 10.0
+# lock_timeout for reading alembic_version after a cancelled run.
+SCHEMA_VERSION_LOCK_TIMEOUT = "5s"
+
+
+def _start_alembic(session_name: str) -> subprocess.Popen:
+    """``alembic upgrade head`` in a child process whose database session carries ``session_name``."""
+    from harbor_clerk.migration_session import APPLICATION_NAME_ENV
+
+    return subprocess.Popen(
+        # This interpreter, not whichever "python" is first on PATH.
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "DATABASE_URL": get_settings().database_url, APPLICATION_NAME_ENV: session_name},
+    )
+
+
+@dataclass(frozen=True)
+class _Stopped:
+    """What stopping a run established; ``error`` is set when the cancel could not be confirmed.
+    ``queued``: another run held the migration lock, so this one had only been waiting for it."""
+
+    sessions: int = 0
+    exited: bool = False
+    version: str = "unknown"
+    error: str | None = None
+    queued: bool = False
+
+
+async def _stop_alembic(proc: subprocess.Popen, session_name: str) -> _Stopped:
+    """Kill alembic, cancel every backend carrying its name, wait for them to exit, read the version.
+
+    Killing the client does not stop its backend: a statement already sent (0009's table rewrite)
+    runs to its end under its locks and only then rolls back. Never raises: a failure is reported
+    in the result.
+    """
+    from harbor_clerk.migration_session import cancel_backends, migration_lock_holder, wait_for_exit
 
     try:
-        result = await asyncio.to_thread(_run)
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Migration failed: {result.stderr[-500:]}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Migration timed out after 120s")
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    engine = None
+    try:
+        await asyncio.to_thread(proc.wait)
+        _close_pipes(proc)
+        # A connection of its own, not the API pool: the deadline fires exactly when requests are
+        # queued behind the rewrite, each holding a pooled connection, so the pool is likely
+        # exhausted and its checkout would wait out the pool timeout while the lock stays held.
+        engine = create_async_engine(
+            get_settings().database_url, poolclass=NullPool, connect_args={"timeout": STOP_CONNECT_TIMEOUT_SECONDS}
+        )
+        async with async_sessionmaker(engine, expire_on_commit=False)() as db:
+            # Past the route's pre-check, a run can still start just behind another and spend the
+            # whole deadline polling for the lock: then the lock's holder is someone else.
+            holder = await migration_lock_holder(db)
+            queued = holder is not None and holder != session_name
+            await db.rollback()
+            cancelled = await cancel_backends(db, session_name)
+            await db.commit()
+            exited = await wait_for_exit(db, session_name, seconds=MIGRATION_CANCEL_WAIT_SECONDS)
+            version = await _schema_version(db)
+    except Exception as exc:
+        logger.exception("Could not cancel the migration run %s", session_name)
+        return _Stopped(error=describe_error(exc))
+    finally:
+        if engine is not None:
+            await engine.dispose()
+    logger.warning(
+        "Stopped migration run %s: %d session(s) cancelled (%d backend(s)); exited=%s; schema at %s",
+        session_name,
+        cancelled.sessions,
+        cancelled.backends,
+        exited,
+        version,
+    )
+    return _Stopped(sessions=cancelled.sessions, exited=exited, version=version, queued=queued)
 
-    # Check resulting version
-    from harbor_clerk.db import async_session_factory
 
-    async with async_session_factory() as db:
-        ver_result = await db.execute(text("SELECT version_num FROM alembic_version"))
-        row = ver_result.first()
-        version = row[0] if row else "unknown"
+def _close_pipes(proc: subprocess.Popen) -> None:
+    """Close the killed child's pipes (communicate() did not finish, so nothing else will)."""
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except Exception:  # a reader thread may still be draining it; the fd goes with the object
+                pass
 
-    return {"status": "ok", "schema_version": version}
+
+def _timeout_detail(stop: _Stopped) -> str:
+    prefix = f"Migration timed out after {MIGRATION_TIMEOUT_SECONDS}s"
+    if stop.error is not None:
+        return (
+            f"{prefix}; it was killed, but cancelling its database session could not be confirmed "
+            f"({stop.error}). A search may wait until it ends. Restart the app (or the API container) to finish the migration at startup."
+        )
+    still = "" if stop.exited else " (still stopping)"
+    if stop.queued:
+        return (
+            f"{prefix} waiting for another migration run, which is still in progress; this run was "
+            f"stopped before it started and changed nothing ({stop.sessions} database session(s) stopped{still}). "
+            f"The database is at revision {stop.version}. Try again when the other run has finished."
+        )
+    head = _expected_schema_head()
+    if head is not None and stop.version == head:
+        return (
+            f"{prefix}, but it had already committed: the migration completed, and the database is at "
+            f"revision {stop.version} ({stop.sessions} database session(s) stopped{still})."
+        )
+    return (
+        f"{prefix} and was cancelled ({stop.sessions} database session(s) stopped{still}); the database "
+        f"is at revision {stop.version}. Restart the app (or the API container) to finish the migration at startup."
+    )
+
+
+def _expected_schema_head() -> str | None:
+    from harbor_clerk.api.app import _get_expected_schema_version
+
+    return _get_expected_schema_version()
+
+
+async def _schema_version(db: AsyncSession) -> str:
+    """The committed alembic revision, or "unknown" (no row, or alembic_version locked too long)."""
+    try:
+        await db.execute(text(f"SET LOCAL lock_timeout = '{SCHEMA_VERSION_LOCK_TIMEOUT}'"))
+        row = (await db.execute(text("SELECT version_num FROM alembic_version"))).first()
+    except DBAPIError:
+        await db.rollback()
+        return "unknown"
+    await db.rollback()
+    return row[0] if row else "unknown"
 
 
 async def _notify_bulk_queue(session: AsyncSession, queue_name: str, count: int) -> None:
