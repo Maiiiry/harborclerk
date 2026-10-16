@@ -3,7 +3,22 @@ import { Link } from 'react-router'
 import { del, get, patch, post } from '../api'
 import { PageHeader } from '../components/PageHeader'
 import { Card } from '../components/Card'
-import { parseRateLimit, parseSnippetCap, snippetCapInput, type NumberFieldParse } from '../utils/apiKeyForm'
+import {
+  defaultExpiryDate,
+  documentScopeSummary,
+  expiryDateInput,
+  formatExpiry,
+  formatExpiryMoment,
+  isLocalEndOfDay,
+  isScopeRestricted,
+  parseExpiry,
+  parseRateLimit,
+  parseSnippetCap,
+  snippetCapInput,
+  unknownScopeIds,
+  type ExpiryParse,
+  type NumberFieldParse,
+} from '../utils/apiKeyForm'
 
 type PermissionTier = 'search' | 'read' | 'full'
 
@@ -40,6 +55,14 @@ interface TopicCluster {
 interface WatchedFolderInfo {
   folder_id: string
   path: string
+}
+
+interface ScopeOptions {
+  topics: TopicCluster[]
+  folders: WatchedFolderInfo[]
+  topicsFailed: boolean // the list failed to load: its stored ids are unknown, not stale
+  foldersFailed: boolean
+  loading: boolean // the lists are still on their way: scope fields wait, the key table does not
 }
 
 interface ScopePreview {
@@ -104,7 +127,11 @@ function toggleToolOverride(
 }
 
 interface ScopeFormState {
-  expiresAt: string // yyyy-mm-dd or ''
+  // Kept apart from the date: a date input reports '' while a segment is cleared, and that must
+  // read as "incomplete", not as "never expires".
+  expiryEnabled: boolean
+  expiresAt: string // yyyy-mm-dd in local time, or '' (incomplete or unset)
+  storedExpiresAt: string | null // the key's saved instant, for an honest hint; never sent
   tier: PermissionTier
   toolOverrides: Record<string, boolean>
   topicIds: number[] | null
@@ -118,7 +145,9 @@ interface ScopeFormState {
 
 function emptyScopeState(): ScopeFormState {
   return {
+    expiryEnabled: false,
     expiresAt: '',
+    storedExpiresAt: null,
     tier: 'full',
     toolOverrides: {},
     topicIds: null,
@@ -133,7 +162,9 @@ function emptyScopeState(): ScopeFormState {
 
 function scopeStateFromKey(k: ApiKeyInfo): ScopeFormState {
   return {
-    expiresAt: k.expires_at ? k.expires_at.slice(0, 10) : '',
+    expiryEnabled: k.expires_at != null,
+    expiresAt: expiryDateInput(k.expires_at),
+    storedExpiresAt: k.expires_at,
     tier: k.permission_tier,
     toolOverrides: { ...k.tool_overrides },
     topicIds: k.scope_topic_ids,
@@ -161,8 +192,8 @@ interface ScopePayload {
 
 type FieldResult<T> = { ok: true; value: T } | { ok: false; error: string }
 
-function expiresAtPayload(expiresAt: string): string | null {
-  return expiresAt ? expiresAt + 'T23:59:59Z' : null
+function expiryField(s: ScopeFormState): ExpiryParse {
+  return parseExpiry(s.expiryEnabled, s.expiresAt)
 }
 
 function snippetCapField(s: ScopeFormState): NumberFieldParse {
@@ -179,6 +210,8 @@ function rphField(s: ScopeFormState): NumberFieldParse {
 
 /** The whole payload for a new key, or the first field error to show. */
 function scopeStateToPayload(s: ScopeFormState): FieldResult<ScopePayload> {
+  const expiry = expiryField(s)
+  if (!expiry.ok) return expiry
   const cap = snippetCapField(s)
   if (!cap.ok) return cap
   const rpm = rpmField(s)
@@ -188,7 +221,7 @@ function scopeStateToPayload(s: ScopeFormState): FieldResult<ScopePayload> {
   return {
     ok: true,
     value: {
-      expires_at: expiresAtPayload(s.expiresAt),
+      expires_at: expiry.value,
       permission_tier: s.tier,
       tool_overrides: s.toolOverrides,
       scope_topic_ids: s.topicIds,
@@ -225,7 +258,11 @@ function changedFields(
     if (!name.trim()) return { ok: false, error: KEY_NAME_ERROR }
     body.name = name.trim()
   }
-  if (s.expiresAt !== initial.expiresAt) body.expires_at = expiresAtPayload(s.expiresAt)
+  if (s.expiryEnabled !== initial.expiryEnabled || (s.expiryEnabled && s.expiresAt !== initial.expiresAt)) {
+    const expiry = expiryField(s)
+    if (!expiry.ok) return expiry
+    body.expires_at = expiry.value
+  }
   if (s.tier !== initial.tier) body.permission_tier = s.tier
   if (!sameSet(s.toolOverrides, initial.toolOverrides)) body.tool_overrides = s.toolOverrides
   if (!sameSet(s.topicIds, initial.topicIds)) body.scope_topic_ids = s.topicIds
@@ -256,7 +293,7 @@ function changedFields(
 
 const KEY_NAME_ERROR = 'Key name cannot be empty.'
 
-function FieldError({ result }: { result: NumberFieldParse }) {
+function FieldError({ result }: { result: { ok: true } | { ok: false; error: string } }) {
   if (result.ok) return null
   return (
     <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-400">
@@ -273,8 +310,13 @@ export default function ApiKeysPage() {
   const [newKey, setNewKey] = useState<ApiKeyCreated | null>(null)
   const [editingKey, setEditingKey] = useState<ApiKeyInfo | null>(null)
 
-  const [topics, setTopics] = useState<TopicCluster[]>([])
-  const [folders, setFolders] = useState<WatchedFolderInfo[]>([])
+  const [scopeOptions, setScopeOptions] = useState<ScopeOptions>({
+    topics: [],
+    folders: [],
+    topicsFailed: false,
+    foldersFailed: false,
+    loading: true,
+  })
 
   async function loadKeys() {
     try {
@@ -282,34 +324,49 @@ export default function ApiKeysPage() {
       setKeys(data)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load keys')
-    } finally {
-      setLoading(false)
     }
   }
 
+  // A list that failed to load is not an empty list: read as empty, every stored id would look
+  // stale, and removing those ids could leave the key with no restriction at all.
   async function loadScopeOptions() {
-    try {
-      const [t, f] = await Promise.all([
-        get<{ clusters: TopicCluster[] }>('/api/stats/topics').catch(() => ({ clusters: [] })),
-        get<WatchedFolderInfo[]>('/api/watch/folders').catch(() => [] as WatchedFolderInfo[]),
-      ])
-      setTopics(t.clusters || [])
-      setFolders(Array.isArray(f) ? f : [])
-    } catch {
-      // non-fatal
-    }
+    const [t, f] = await Promise.all([
+      get<{ clusters: TopicCluster[] }>('/api/stats/topics').then(
+        (r) => r.clusters || [],
+        () => null,
+      ),
+      get<WatchedFolderInfo[]>('/api/watch/folders').then(
+        (r) => (Array.isArray(r) ? r : []),
+        () => null,
+      ),
+    ])
+    setScopeOptions({
+      topics: t ?? [],
+      folders: f ?? [],
+      topicsFailed: t === null,
+      foldersFailed: f === null,
+      loading: false,
+    })
   }
 
   useEffect(() => {
+    // The key table (and Revoke) wait only for the keys. The topic and folder lists load
+    // alongside; the forms' scope fields wait for them (ScopeOptions.loading), since before they
+    // arrive every stored id would look as if it were no longer listed.
     async function run() {
+      void loadScopeOptions() // not awaited: the table must not wait for it
       await loadKeys()
-      await loadScopeOptions()
+      setLoading(false)
     }
     run()
   }, [])
 
+  // Revoke is confirmed in the row, not with window.confirm: the macOS app hosts this page in a
+  // WKWebView, where window.confirm silently returns false, so Revoke never revoked (#833).
+  const [pendingRevokeId, setPendingRevokeId] = useState<string | null>(null)
+
   async function handleRevoke(keyId: string) {
-    if (!confirm('Revoke this API key? This cannot be undone.')) return
+    setPendingRevokeId(null)
     try {
       await del(`/api/api-keys/${keyId}`)
       await loadKeys()
@@ -371,8 +428,7 @@ export default function ApiKeysPage() {
 
       {showCreate && !newKey && (
         <CreateKeyForm
-          topics={topics}
-          folders={folders}
+          options={scopeOptions}
           onCreated={(key) => {
             setNewKey(key)
             loadKeys()
@@ -431,9 +487,7 @@ export default function ApiKeysPage() {
                   </span>
                 </td>
                 <td className="px-4 py-3 text-sm text-gray-600 dark:text-gray-300">{k.scope_summary}</td>
-                <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                  {k.expires_at ? new Date(k.expires_at).toLocaleDateString() : 'Never'}
-                </td>
+                <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{formatExpiry(k.expires_at)}</td>
                 <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
                   {new Date(k.created_at).toLocaleDateString()}
                 </td>
@@ -441,7 +495,26 @@ export default function ApiKeysPage() {
                   {k.last_used_at ? new Date(k.last_used_at).toLocaleString() : 'Never'}
                 </td>
                 <td className="px-4 py-3 text-right">
-                  {k.is_active && (
+                  {k.is_active && pendingRevokeId === k.key_id && (
+                    <div className="flex items-center justify-end gap-2">
+                      <span className="text-sm text-red-600 dark:text-red-400">
+                        Revoke this key? This cannot be undone.
+                      </span>
+                      <button
+                        onClick={() => handleRevoke(k.key_id)}
+                        className="rounded-lg bg-red-600 px-3 py-1 text-sm font-medium text-white shadow-xs hover:bg-red-700"
+                      >
+                        Confirm revoke
+                      </button>
+                      <button
+                        onClick={() => setPendingRevokeId(null)}
+                        className="rounded-lg bg-gray-200 dark:bg-gray-700 px-3 py-1 text-sm font-medium text-gray-800 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-600"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                  {k.is_active && pendingRevokeId !== k.key_id && (
                     <div className="flex justify-end gap-3">
                       <button
                         onClick={() => setEditingKey(k)}
@@ -450,7 +523,7 @@ export default function ApiKeysPage() {
                         Edit
                       </button>
                       <button
-                        onClick={() => handleRevoke(k.key_id)}
+                        onClick={() => setPendingRevokeId(k.key_id)}
                         className="text-sm text-red-600 dark:text-red-400 hover:underline"
                       >
                         Revoke
@@ -474,8 +547,7 @@ export default function ApiKeysPage() {
       {editingKey && (
         <EditKeyModal
           apiKey={editingKey}
-          topics={topics}
-          folders={folders}
+          options={scopeOptions}
           onClose={() => setEditingKey(null)}
           onSaved={() => {
             setEditingKey(null)
@@ -491,41 +563,136 @@ export default function ApiKeysPage() {
 // Shared scope form fields
 // ---------------------------------------------------------------------------
 
+function UnknownScopeChips<T extends number | string>({
+  kind,
+  ids,
+  onRemove,
+}: {
+  kind: 'topic' | 'folder'
+  ids: T[]
+  onRemove: (id: T) => void
+}) {
+  if (ids.length === 0) return null
+  return (
+    <div className="mb-2 rounded-sm bg-amber-50 dark:bg-amber-900/20 p-2 text-xs text-amber-800 dark:text-amber-300">
+      <p className="mb-1.5">
+        The key is still limited to {ids.length === 1 ? `this ${kind}` : `these ${kind}s`}, which{' '}
+        {ids.length === 1 ? 'is' : 'are'} no longer in the list. Remove {ids.length === 1 ? 'it' : 'them'} to drop the
+        restriction.
+      </p>
+      <ul className="flex flex-wrap gap-1.5" aria-label={`Unlisted ${kind}s`}>
+        {ids.map((id) => (
+          <li
+            key={String(id)}
+            className="flex items-center gap-1 rounded-md bg-white dark:bg-[#1e1e1f] px-2 py-0.5 ring-1 ring-amber-300 dark:ring-amber-700"
+          >
+            <span className="font-mono">
+              {kind === 'topic' ? 'Topic' : 'Folder'} {String(id)}
+            </span>
+            <button
+              type="button"
+              onClick={() => onRemove(id)}
+              aria-label={`Remove ${kind} ${String(id)}`}
+              className="text-amber-700 hover:text-amber-900 dark:text-amber-400 dark:hover:text-amber-200"
+            >
+              ×
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+function ScopeListFailed({ kind, storedCount }: { kind: 'topic' | 'folder'; storedCount: number }) {
+  return (
+    <p role="alert" className="text-xs text-red-600 dark:text-red-400">
+      The {kind} list could not be loaded, so {kind}s cannot be changed here.{' '}
+      {storedCount > 0
+        ? `The key's ${storedCount} stored ${kind} restriction${storedCount === 1 ? ' is' : 's are'} kept as is.`
+        : ''}{' '}
+      Reload the page to try again.
+    </p>
+  )
+}
+
 function ScopeFormFields({
   state,
   setState,
-  topics,
-  folders,
+  options,
 }: {
   state: ScopeFormState
   setState: (updater: (prev: ScopeFormState) => ScopeFormState) => void
-  topics: TopicCluster[]
-  folders: WatchedFolderInfo[]
+  options: ScopeOptions
 }) {
   const parsedCap = snippetCapField(state)
+  const parsedExpiry = expiryField(state)
+  // The saved instant is kept on save while its date is left as it is (changedFields sends no
+  // expiry then), so the hint must name that instant when it is not the end of a local day: a
+  // key saved by the old UI, or a time set through the API.
+  const keepsStoredTime =
+    state.expiryEnabled &&
+    state.storedExpiresAt != null &&
+    state.expiresAt === expiryDateInput(state.storedExpiresAt) &&
+    !isLocalEndOfDay(state.storedExpiresAt)
+  const { topics, folders, topicsFailed, foldersFailed, loading: optionsLoading } = options
+  // Stored ids a loaded list no longer shows (a topic re-clustered away, a folder removed). The
+  // key is still limited to them, so they stay visible and removable. A list that failed to load
+  // says nothing about its ids: they are shown as kept, with nothing offered for removal.
+  const unknownTopicIds =
+    topicsFailed || optionsLoading
+      ? []
+      : unknownScopeIds(
+          state.topicIds,
+          topics.map((t) => t.cluster_id),
+        )
+  const unknownFolderIds =
+    foldersFailed || optionsLoading
+      ? []
+      : unknownScopeIds(
+          state.folderIds,
+          folders.map((f) => f.folder_id),
+        )
   return (
     <div className="space-y-4">
       <div>
         <label className="flex items-center gap-2 text-xs font-medium text-gray-700 dark:text-gray-300">
           <input
             type="checkbox"
-            checked={state.expiresAt !== ''}
+            checked={state.expiryEnabled}
             onChange={(e) =>
               setState((s) => ({
                 ...s,
-                expiresAt: e.target.checked ? new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10) : '',
+                expiryEnabled: e.target.checked,
+                // Unticking keeps the date, so ticking again restores it rather than a new default.
+                expiresAt: e.target.checked ? s.expiresAt || defaultExpiryDate() : s.expiresAt,
               }))
             }
           />
           Set expiry date
         </label>
-        {state.expiresAt !== '' && (
-          <input
-            type="date"
-            value={state.expiresAt}
-            onChange={(e) => setState((s) => ({ ...s, expiresAt: e.target.value }))}
-            className="mt-1.5 rounded-lg border-0 bg-(--color-bg-secondary) dark:bg-(--color-bg-tertiary) shadow-mac focus:ring-2 focus:ring-(--color-accent)/30 px-3 py-1.5 text-sm"
-          />
+        {state.expiryEnabled && (
+          <>
+            <input
+              type="date"
+              aria-label="Expiry date"
+              value={state.expiresAt}
+              onChange={(e) => setState((s) => ({ ...s, expiresAt: e.target.value }))}
+              className="mt-1.5 rounded-lg border-0 bg-(--color-bg-secondary) dark:bg-(--color-bg-tertiary) shadow-mac focus:ring-2 focus:ring-(--color-accent)/30 px-3 py-1.5 text-sm"
+            />
+            {!parsedExpiry.ok ? (
+              <FieldError result={parsedExpiry} />
+            ) : keepsStoredTime ? (
+              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                The key stops working at {formatExpiryMoment(state.storedExpiresAt!)}, the time it was saved with.
+                Choosing another date sets the end of that day, in this computer&apos;s time zone.
+              </p>
+            ) : (
+              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                The key stops working at the end of this day, in this computer&apos;s time zone.
+              </p>
+            )}
+          </>
         )}
       </div>
 
@@ -579,70 +746,114 @@ function ScopeFormFields({
 
       <details className="rounded-lg bg-(--color-bg-secondary) dark:bg-(--color-bg-tertiary) p-3">
         <summary className="cursor-pointer text-xs font-medium text-gray-700 dark:text-gray-300">
-          Document scope (empty = no restriction)
+          Document scope: {documentScopeSummary(state.topicIds, state.folderIds)}
+          {unknownTopicIds.length + unknownFolderIds.length > 0 && (
+            <span className="ml-1 text-amber-700 dark:text-amber-400">
+              ({unknownTopicIds.length + unknownFolderIds.length} no longer listed)
+            </span>
+          )}
+          {(topicsFailed || foldersFailed) && (
+            <span className="ml-1 text-red-600 dark:text-red-400">
+              ({[topicsFailed && 'topics', foldersFailed && 'folders'].filter(Boolean).join(' and ')} could not be
+              loaded)
+            </span>
+          )}
         </summary>
         <div className="mt-3 space-y-3">
-          <div>
-            <p className="mb-1 text-xs font-medium text-gray-600 dark:text-gray-400">Topics</p>
-            {topics.length === 0 ? (
-              <p className="text-xs text-gray-500 dark:text-gray-400">No topics available.</p>
-            ) : (
-              <div className="max-h-40 overflow-y-auto rounded-sm bg-white dark:bg-[#1e1e1f] p-2 ring-1 ring-(--color-border)">
-                {topics.map((t) => {
-                  const selected = state.topicIds?.includes(t.cluster_id) ?? false
-                  return (
-                    <label key={t.cluster_id} className="flex items-center gap-1.5 text-xs py-0.5">
-                      <input
-                        type="checkbox"
-                        checked={selected}
-                        onChange={(e) =>
-                          setState((s) => {
-                            const current = s.topicIds ?? []
-                            const next = e.target.checked
-                              ? [...current, t.cluster_id]
-                              : current.filter((id) => id !== t.cluster_id)
-                            return { ...s, topicIds: next.length > 0 ? next : null }
-                          })
-                        }
-                      />
-                      <span>{t.name}</span>
-                    </label>
-                  )
-                })}
+          {optionsLoading ? (
+            <p role="status" className="text-xs text-gray-500 dark:text-gray-400">
+              Loading topics and folders…
+            </p>
+          ) : (
+            <>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Tick nothing for no restriction.</p>
+              <div>
+                <p className="mb-1 text-xs font-medium text-gray-600 dark:text-gray-400">Topics</p>
+                <UnknownScopeChips
+                  kind="topic"
+                  ids={unknownTopicIds}
+                  onRemove={(id) =>
+                    setState((s) => {
+                      const next = (s.topicIds ?? []).filter((t) => t !== id)
+                      return { ...s, topicIds: next.length > 0 ? next : null }
+                    })
+                  }
+                />
+                {topicsFailed ? (
+                  <ScopeListFailed kind="topic" storedCount={state.topicIds?.length ?? 0} />
+                ) : topics.length === 0 ? (
+                  <p className="text-xs text-gray-500 dark:text-gray-400">No topics available.</p>
+                ) : (
+                  <div className="max-h-40 overflow-y-auto rounded-sm bg-white dark:bg-[#1e1e1f] p-2 ring-1 ring-(--color-border)">
+                    {topics.map((t) => {
+                      const selected = state.topicIds?.includes(t.cluster_id) ?? false
+                      return (
+                        <label key={t.cluster_id} className="flex items-center gap-1.5 text-xs py-0.5">
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={(e) =>
+                              setState((s) => {
+                                const current = s.topicIds ?? []
+                                const next = e.target.checked
+                                  ? [...current, t.cluster_id]
+                                  : current.filter((id) => id !== t.cluster_id)
+                                return { ...s, topicIds: next.length > 0 ? next : null }
+                              })
+                            }
+                          />
+                          <span>{t.name}</span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
-            )}
-          </div>
 
-          <div>
-            <p className="mb-1 text-xs font-medium text-gray-600 dark:text-gray-400">Watched folders</p>
-            {folders.length === 0 ? (
-              <p className="text-xs text-gray-500 dark:text-gray-400">No watched folders configured.</p>
-            ) : (
-              <div className="max-h-40 overflow-y-auto rounded-sm bg-white dark:bg-[#1e1e1f] p-2 ring-1 ring-(--color-border)">
-                {folders.map((f) => {
-                  const selected = state.folderIds?.includes(f.folder_id) ?? false
-                  return (
-                    <label key={f.folder_id} className="flex items-center gap-1.5 text-xs py-0.5">
-                      <input
-                        type="checkbox"
-                        checked={selected}
-                        onChange={(e) =>
-                          setState((s) => {
-                            const current = s.folderIds ?? []
-                            const next = e.target.checked
-                              ? [...current, f.folder_id]
-                              : current.filter((id) => id !== f.folder_id)
-                            return { ...s, folderIds: next.length > 0 ? next : null }
-                          })
-                        }
-                      />
-                      <span className="font-mono">{f.path}</span>
-                    </label>
-                  )
-                })}
+              <div>
+                <p className="mb-1 text-xs font-medium text-gray-600 dark:text-gray-400">Watched folders</p>
+                <UnknownScopeChips
+                  kind="folder"
+                  ids={unknownFolderIds}
+                  onRemove={(id) =>
+                    setState((s) => {
+                      const next = (s.folderIds ?? []).filter((f) => f !== id)
+                      return { ...s, folderIds: next.length > 0 ? next : null }
+                    })
+                  }
+                />
+                {foldersFailed ? (
+                  <ScopeListFailed kind="folder" storedCount={state.folderIds?.length ?? 0} />
+                ) : folders.length === 0 ? (
+                  <p className="text-xs text-gray-500 dark:text-gray-400">No watched folders configured.</p>
+                ) : (
+                  <div className="max-h-40 overflow-y-auto rounded-sm bg-white dark:bg-[#1e1e1f] p-2 ring-1 ring-(--color-border)">
+                    {folders.map((f) => {
+                      const selected = state.folderIds?.includes(f.folder_id) ?? false
+                      return (
+                        <label key={f.folder_id} className="flex items-center gap-1.5 text-xs py-0.5">
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={(e) =>
+                              setState((s) => {
+                                const current = s.folderIds ?? []
+                                const next = e.target.checked
+                                  ? [...current, f.folder_id]
+                                  : current.filter((id) => id !== f.folder_id)
+                                return { ...s, folderIds: next.length > 0 ? next : null }
+                              })
+                            }
+                          />
+                          <span className="font-mono">{f.path}</span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
-            )}
-          </div>
+            </>
+          )}
         </div>
       </details>
 
@@ -737,13 +948,11 @@ function ScopeFormFields({
 function CreateKeyForm({
   onCreated,
   onError,
-  topics,
-  folders,
+  options,
 }: {
   onCreated: (key: ApiKeyCreated) => void
   onError: (msg: string) => void
-  topics: TopicCluster[]
-  folders: WatchedFolderInfo[]
+  options: ScopeOptions
 }) {
   const [name, setName] = useState('')
   const [scope, setScope] = useState<ScopeFormState>(emptyScopeState())
@@ -787,7 +996,7 @@ function CreateKeyForm({
           />
         </div>
 
-        <ScopeFormFields state={scope} setState={setScope} topics={topics} folders={folders} />
+        <ScopeFormFields state={scope} setState={setScope} options={options} />
 
         <div className="flex justify-end">
           <button
@@ -809,14 +1018,12 @@ function CreateKeyForm({
 
 function EditKeyModal({
   apiKey,
-  topics,
-  folders,
+  options,
   onClose,
   onSaved,
 }: {
   apiKey: ApiKeyInfo
-  topics: TopicCluster[]
-  folders: WatchedFolderInfo[]
+  options: ScopeOptions
   onClose: () => void
   onSaved: () => void
 }) {
@@ -826,6 +1033,9 @@ function EditKeyModal({
   // Shown inside the modal: the page's error banner sits behind the overlay.
   const [saveError, setSaveError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  // Asked in the modal (no native dialog) before a save that leaves a restricted key with no
+  // document restriction, so it would read the whole corpus. Any scope edit withdraws the question.
+  const [confirmUnrestrict, setConfirmUnrestrict] = useState(false)
   const [preview, setPreview] = useState<ScopePreview | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const debounceRef = useRef<number | null>(null)
@@ -865,7 +1075,12 @@ function EditKeyModal({
     }
   }, [apiKey.key_id, payloadKey, scopePayload])
 
-  async function handleSave() {
+  function updateScope(updater: (prev: ScopeFormState) => ScopeFormState) {
+    setConfirmUnrestrict(false)
+    setScope(updater)
+  }
+
+  async function handleSave(unrestrictConfirmed = false) {
     setSaveError('')
     const changed = changedFields(name, apiKey.name, scope, initialScope)
     if (!changed.ok) {
@@ -876,6 +1091,14 @@ function EditKeyModal({
       onClose() // nothing changed: nothing to send
       return
     }
+    const dropsLastRestriction =
+      isScopeRestricted(initialScope.topicIds, initialScope.folderIds) &&
+      !isScopeRestricted(scope.topicIds, scope.folderIds)
+    if (dropsLastRestriction && !unrestrictConfirmed) {
+      setConfirmUnrestrict(true)
+      return
+    }
+    setConfirmUnrestrict(false)
     setSubmitting(true)
     try {
       await patch(`/api/api-keys/${apiKey.key_id}`, changed.value)
@@ -917,7 +1140,7 @@ function EditKeyModal({
           />
         </div>
 
-        <ScopeFormFields state={scope} setState={setScope} topics={topics} folders={folders} />
+        <ScopeFormFields state={scope} setState={updateScope} options={options} />
 
         <div className="mt-4 rounded-lg bg-(--color-bg-secondary) dark:bg-(--color-bg-tertiary) p-3 text-xs">
           {previewLoading && <span className="text-gray-500 dark:text-gray-400">Loading scope preview…</span>}
@@ -941,6 +1164,33 @@ function EditKeyModal({
           </div>
         )}
 
+        {confirmUnrestrict && (
+          <div
+            role="alert"
+            className="mt-4 rounded-sm bg-amber-50 dark:bg-amber-900/20 p-3 text-sm text-amber-800 dark:text-amber-300"
+          >
+            <p>
+              This removes the key&apos;s last document restriction. Once saved, it can read every document in the
+              corpus.
+            </p>
+            <div className="mt-2 flex justify-end gap-2">
+              <button
+                onClick={() => setConfirmUnrestrict(false)}
+                className="rounded-lg bg-gray-200 dark:bg-gray-700 px-3 py-1 text-sm font-medium text-gray-800 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-600"
+              >
+                Keep editing
+              </button>
+              <button
+                onClick={() => handleSave(true)}
+                disabled={submitting}
+                className="rounded-lg bg-red-600 px-3 py-1 text-sm font-medium text-white shadow-xs hover:bg-red-700 disabled:opacity-50"
+              >
+                Remove restriction and save
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="mt-5 flex justify-end gap-3">
           <button
             onClick={onClose}
@@ -949,7 +1199,7 @@ function EditKeyModal({
             Cancel
           </button>
           <button
-            onClick={handleSave}
+            onClick={() => handleSave()}
             disabled={submitting}
             className="rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-medium text-white shadow-xs hover:bg-blue-700 disabled:opacity-50"
           >

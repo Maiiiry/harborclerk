@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { get, post, del } from '../api'
@@ -179,5 +179,85 @@ describe('DocumentDetailPage', () => {
     expect(screen.getByText('not needed')).toBeInTheDocument()
     expect(screen.getByText('summary available')).toBeInTheDocument()
     expect(screen.queryByText('pending')).not.toBeInTheDocument()
+  })
+
+  // #833: window.confirm silently returns false in the macOS app's WKWebView.
+  it('deletes through the in-page confirm, even where window.confirm returns false', async () => {
+    const nativeConfirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    delMock.mockResolvedValue(undefined)
+    renderDocumentDetail()
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }))
+    expect(screen.getByText('Delete this document? This cannot be undone.')).toBeInTheDocument()
+    expect(delMock).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }))
+    await waitFor(() => expect(delMock).toHaveBeenCalledWith('/api/docs/doc-1'))
+    expect(nativeConfirm).not.toHaveBeenCalled()
+    nativeConfirm.mockRestore()
+  })
+
+  it('sends nothing when the document delete is cancelled', async () => {
+    renderDocumentDetail()
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('button', { name: 'Confirm delete' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument()
+    expect(delMock).not.toHaveBeenCalled()
+  })
+
+  it('shows a failed delete on the page, clears the armed state and stays on the document', async () => {
+    delMock.mockRejectedValue(new Error('Document is locked'))
+    renderDocumentDetail()
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }))
+    expect(await screen.findByText('Document is locked')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Confirm delete' })).not.toBeInTheDocument()
+    const deleteButton = screen.getByRole('button', { name: 'Delete' })
+    expect(deleteButton).toBeEnabled() // actionLoading is released on failure
+    expect(screen.getByRole('heading', { name: 'Ready document' })).toBeInTheDocument()
+    expect(delMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins current behaviour: Reprocess does not disarm a pending Delete. While it runs, Confirm
+  // delete is disabled (actionLoading); once it finishes, the confirmation is still there.
+  it('keeps an armed Delete through a Reprocess, disabled while the Reprocess runs', async () => {
+    let finishReprocess: () => void = () => {}
+    postMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishReprocess = () => resolve(undefined)
+        }),
+    )
+    renderDocumentDetail()
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reprocess' }))
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith('/api/docs/doc-1/reprocess'))
+    expect(screen.getByRole('button', { name: 'Confirm delete' })).toBeDisabled()
+
+    finishReprocess()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Confirm delete' })).toBeEnabled())
+    expect(delMock).not.toHaveBeenCalled()
+  })
+
+  it('does not carry an armed Delete to a related document opened from the page', async () => {
+    const OTHER_DOC = { ...READY_DOC, doc_id: 'doc-2', title: 'Related document', canonical_filename: 'related.pdf' }
+    getMock.mockImplementation((url) => {
+      if (url === '/api/docs/doc-1') return Promise.resolve(READY_DOC)
+      if (url === '/api/docs/doc-1/related')
+        return Promise.resolve({
+          related: [{ doc_id: 'doc-2', title: 'Related document', summary: null, similarity: 0.9 }],
+        })
+      if (url === '/api/docs/doc-2') return Promise.resolve(OTHER_DOC)
+      if (url === '/api/docs/doc-2/related') return Promise.resolve({ related: [] })
+      return Promise.reject(new Error(`Unexpected URL: ${url}`))
+    })
+    renderDocumentDetail()
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' })) // arm on doc-1
+    expect(screen.getByRole('button', { name: 'Confirm delete' })).toBeInTheDocument()
+
+    fireEvent.click(await screen.findByRole('link', { name: /Related document/ })) // same route, doc-2
+    expect(await screen.findByRole('heading', { name: 'Related document' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Confirm delete' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument()
+    expect(delMock).not.toHaveBeenCalled()
   })
 })
