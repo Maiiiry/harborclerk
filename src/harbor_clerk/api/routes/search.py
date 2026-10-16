@@ -28,6 +28,7 @@ from harbor_clerk.api.scope_validation import validate_scope_folders
 from harbor_clerk.config import get_settings
 from harbor_clerk.db import get_session
 from harbor_clerk.models import Chunk, Document
+from harbor_clerk.passage_cap import cap_passage_text, cap_text, snippet_cap
 from harbor_clerk.search import find_all, hybrid_search
 from harbor_clerk.search_types import FindAllHit
 from harbor_clerk.source_ref import SourceRef, format_document_citation, format_pages, load_source_ref_context
@@ -36,12 +37,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["search"])
 
 
-def _hit_to_out(h, source_ref: SourceRef | None = None) -> SearchHitOut:
+def _hit_to_out(h, source_ref: SourceRef | None = None, *, cap: int | None = None) -> SearchHitOut:
+    """``cap`` is the calling key's snippet cap (``snippet_cap``): the hit's text is the chunk's prefix."""
     return SearchHitOut(
         chunk_id=h.chunk_id,
         doc_id=h.doc_id,
         chunk_num=h.chunk_num,
-        chunk_text=h.chunk_text,
+        chunk_text=cap_text(h.chunk_text, cap),
         page_start=h.page_start,
         page_end=h.page_end,
         language=h.language,
@@ -241,6 +243,7 @@ async def search(
     source_context = await load_source_ref_context(
         session, [h.doc_id for h in result.hits], folder_label_from_path=is_human(principal)
     )
+    cap = snippet_cap(principal)
     hits_out = [
         _hit_to_out(
             h,
@@ -249,6 +252,7 @@ async def search(
                 chunk_id=h.chunk_id,
                 pages=format_pages(h.page_start, h.page_end),
             ),
+            cap=cap,
         )
         for h in result.hits
     ]
@@ -382,7 +386,7 @@ async def search_find_all(
             job_issue=body.job_issue,
             presentation=body.presentation,
             # A capped key's snippet is the chunk's prefix within its max_snippet_chars, as on kb_find_all.
-            key_max_snippet_chars=principal.key_scope.max_snippet_chars if principal.key_scope else None,
+            key_max_snippet_chars=snippet_cap(principal),
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
@@ -473,7 +477,7 @@ async def read_passages(
                     Chunk.chunk_num == chunk.chunk_num - 1,
                 )
             )
-            prev_text = prev_result.scalar_one_or_none()
+            prev_text = cap_passage_text(prev_result.scalar_one_or_none() or "", principal)
             if prev_text:
                 context_before[chunk.chunk_id] = prev_text
 
@@ -484,7 +488,7 @@ async def read_passages(
                     Chunk.chunk_num == chunk.chunk_num + 1,
                 )
             )
-            next_text = next_result.scalar_one_or_none()
+            next_text = cap_passage_text(next_result.scalar_one_or_none() or "", principal)
             if next_text:
                 context_after[chunk.chunk_id] = next_text
 
@@ -505,7 +509,7 @@ async def read_passages(
                 chunk_id=str(cid),
                 doc_id=str(chunk.doc_id),
                 chunk_num=chunk.chunk_num,
-                chunk_text=chunk.chunk_text,
+                chunk_text=cap_passage_text(chunk.chunk_text, principal),
                 page_start=chunk.page_start,
                 page_end=chunk.page_end,
                 language=chunk.language,

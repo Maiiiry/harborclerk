@@ -3,6 +3,7 @@ import { Link } from 'react-router'
 import { del, get, patch, post } from '../api'
 import { PageHeader } from '../components/PageHeader'
 import { Card } from '../components/Card'
+import { parseRateLimit, parseSnippetCap, snippetCapInput, type NumberFieldParse } from '../utils/apiKeyForm'
 
 type PermissionTier = 'search' | 'read' | 'full'
 
@@ -137,10 +138,12 @@ function scopeStateFromKey(k: ApiKeyInfo): ScopeFormState {
     toolOverrides: { ...k.tool_overrides },
     topicIds: k.scope_topic_ids,
     folderIds: k.scope_folder_ids,
-    maxSnippetChars: k.max_snippet_chars != null ? String(k.max_snippet_chars) : '',
-    rateLimitRpmUnlimited: k.rate_limit_rpm === 0,
+    maxSnippetChars: snippetCapInput(k.max_snippet_chars),
+    // The rate limiter treats any value <= 0 as unlimited (a legacy negative included), as does
+    // the scope summary, so the form shows it that way.
+    rateLimitRpmUnlimited: k.rate_limit_rpm != null && k.rate_limit_rpm <= 0,
     rateLimitRpm: k.rate_limit_rpm != null && k.rate_limit_rpm > 0 ? String(k.rate_limit_rpm) : '',
-    rateLimitRphUnlimited: k.rate_limit_rph === 0,
+    rateLimitRphUnlimited: k.rate_limit_rph != null && k.rate_limit_rph <= 0,
     rateLimitRph: k.rate_limit_rph != null && k.rate_limit_rph > 0 ? String(k.rate_limit_rph) : '',
   }
 }
@@ -156,18 +159,110 @@ interface ScopePayload {
   rate_limit_rph: number | null
 }
 
-function scopeStateToPayload(s: ScopeFormState): ScopePayload {
-  const maxSnippet = s.maxSnippetChars.trim() ? Number(s.maxSnippetChars) : null
+type FieldResult<T> = { ok: true; value: T } | { ok: false; error: string }
+
+function expiresAtPayload(expiresAt: string): string | null {
+  return expiresAt ? expiresAt + 'T23:59:59Z' : null
+}
+
+function snippetCapField(s: ScopeFormState): NumberFieldParse {
+  return parseSnippetCap(s.maxSnippetChars)
+}
+
+function rpmField(s: ScopeFormState): NumberFieldParse {
+  return s.rateLimitRpmUnlimited ? { ok: true, value: 0 } : parseRateLimit(s.rateLimitRpm, 'Requests/min')
+}
+
+function rphField(s: ScopeFormState): NumberFieldParse {
+  return s.rateLimitRphUnlimited ? { ok: true, value: 0 } : parseRateLimit(s.rateLimitRph, 'Requests/hour')
+}
+
+/** The whole payload for a new key, or the first field error to show. */
+function scopeStateToPayload(s: ScopeFormState): FieldResult<ScopePayload> {
+  const cap = snippetCapField(s)
+  if (!cap.ok) return cap
+  const rpm = rpmField(s)
+  if (!rpm.ok) return rpm
+  const rph = rphField(s)
+  if (!rph.ok) return rph
   return {
-    expires_at: s.expiresAt ? s.expiresAt + 'T23:59:59Z' : null,
-    permission_tier: s.tier,
-    tool_overrides: s.toolOverrides,
-    scope_topic_ids: s.topicIds,
-    scope_folder_ids: s.folderIds,
-    max_snippet_chars: maxSnippet != null && Number.isFinite(maxSnippet) && maxSnippet > 0 ? maxSnippet : null,
-    rate_limit_rpm: s.rateLimitRpmUnlimited ? 0 : s.rateLimitRpm.trim() ? Number(s.rateLimitRpm) : null,
-    rate_limit_rph: s.rateLimitRphUnlimited ? 0 : s.rateLimitRph.trim() ? Number(s.rateLimitRph) : null,
+    ok: true,
+    value: {
+      expires_at: expiresAtPayload(s.expiresAt),
+      permission_tier: s.tier,
+      tool_overrides: s.toolOverrides,
+      scope_topic_ids: s.topicIds,
+      scope_folder_ids: s.folderIds,
+      max_snippet_chars: cap.value,
+      rate_limit_rpm: rpm.value,
+      rate_limit_rph: rph.value,
+    },
   }
+}
+
+// Order-insensitive comparison for the override map and the id lists, which the
+// checkboxes rebuild in click order.
+function sameSet(a: Record<string, boolean> | (number | string)[] | null, b: typeof a): boolean {
+  const norm = (v: typeof a) =>
+    v == null ? 'null' : Array.isArray(v) ? JSON.stringify([...v].sort()) : JSON.stringify(Object.entries(v).sort())
+  return norm(a) === norm(b)
+}
+
+/**
+ * The PATCH body for an edit: only the fields the operator changed, compared with the form as it
+ * was loaded. PATCH applies every field it is sent, and the form cannot represent every stored
+ * value (an expiry time is shown as its date, a negative rate limit as unlimited, a legacy
+ * negative cap as 0, a name with surrounding spaces trimmed), so re-sending an untouched field would silently change the key.
+ */
+function changedFields(
+  name: string,
+  initialName: string,
+  s: ScopeFormState,
+  initial: ScopeFormState,
+): FieldResult<Partial<ScopePayload> & { name?: string }> {
+  const body: Partial<ScopePayload> & { name?: string } = {}
+  if (name.trim() !== initialName.trim()) {
+    if (!name.trim()) return { ok: false, error: KEY_NAME_ERROR }
+    body.name = name.trim()
+  }
+  if (s.expiresAt !== initial.expiresAt) body.expires_at = expiresAtPayload(s.expiresAt)
+  if (s.tier !== initial.tier) body.permission_tier = s.tier
+  if (!sameSet(s.toolOverrides, initial.toolOverrides)) body.tool_overrides = s.toolOverrides
+  if (!sameSet(s.topicIds, initial.topicIds)) body.scope_topic_ids = s.topicIds
+  if (!sameSet(s.folderIds, initial.folderIds)) body.scope_folder_ids = s.folderIds
+  if (s.maxSnippetChars.trim() !== initial.maxSnippetChars.trim()) {
+    const cap = snippetCapField(s)
+    if (!cap.ok) return cap
+    body.max_snippet_chars = cap.value
+  }
+  if (
+    s.rateLimitRpmUnlimited !== initial.rateLimitRpmUnlimited ||
+    s.rateLimitRpm.trim() !== initial.rateLimitRpm.trim()
+  ) {
+    const rpm = rpmField(s)
+    if (!rpm.ok) return rpm
+    body.rate_limit_rpm = rpm.value
+  }
+  if (
+    s.rateLimitRphUnlimited !== initial.rateLimitRphUnlimited ||
+    s.rateLimitRph.trim() !== initial.rateLimitRph.trim()
+  ) {
+    const rph = rphField(s)
+    if (!rph.ok) return rph
+    body.rate_limit_rph = rph.value
+  }
+  return { ok: true, value: body }
+}
+
+const KEY_NAME_ERROR = 'Key name cannot be empty.'
+
+function FieldError({ result }: { result: NumberFieldParse }) {
+  if (result.ok) return null
+  return (
+    <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-400">
+      {result.error}
+    </p>
+  )
 }
 
 export default function ApiKeysPage() {
@@ -386,7 +481,6 @@ export default function ApiKeysPage() {
             setEditingKey(null)
             loadKeys()
           }}
-          onError={setError}
         />
       )}
     </div>
@@ -408,6 +502,7 @@ function ScopeFormFields({
   topics: TopicCluster[]
   folders: WatchedFolderInfo[]
 }) {
+  const parsedCap = snippetCapField(state)
   return (
     <div className="space-y-4">
       <div>
@@ -556,13 +651,22 @@ function ScopeFormFields({
           Max snippet chars (optional)
         </label>
         <input
-          type="number"
-          min="1"
+          type="text"
+          inputMode="numeric"
+          aria-label="Max snippet chars"
           value={state.maxSnippetChars}
           onChange={(e) => setState((s) => ({ ...s, maxSnippetChars: e.target.value }))}
           placeholder="No limit"
           className="w-40 rounded-lg border-0 bg-(--color-bg-secondary) dark:bg-(--color-bg-tertiary) shadow-mac focus:ring-2 focus:ring-(--color-accent)/30 px-3 py-1.5 text-sm"
         />
+        {!parsedCap.ok ? (
+          <FieldError result={parsedCap} />
+        ) : (
+          <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+            Passage and page text the key receives is cut to its first N characters; 0 returns citations without passage
+            text. Titles, summaries and metadata are not capped. Empty = no limit.
+          </p>
+        )}
       </div>
 
       <div>
@@ -582,14 +686,16 @@ function ScopeFormFields({
         </label>
         {!state.rateLimitRpmUnlimited && (
           <input
-            type="number"
-            min="1"
+            type="text"
+            inputMode="numeric"
+            aria-label="Requests per minute"
             value={state.rateLimitRpm}
             onChange={(e) => setState((s) => ({ ...s, rateLimitRpm: e.target.value }))}
             placeholder="System default"
             className="mt-1.5 w-40 rounded-lg border-0 bg-(--color-bg-secondary) dark:bg-(--color-bg-tertiary) shadow-mac focus:ring-2 focus:ring-(--color-accent)/30 px-3 py-1.5 text-sm"
           />
         )}
+        <FieldError result={rpmField(state)} />
       </div>
 
       <div>
@@ -609,14 +715,16 @@ function ScopeFormFields({
         </label>
         {!state.rateLimitRphUnlimited && (
           <input
-            type="number"
-            min="1"
+            type="text"
+            inputMode="numeric"
+            aria-label="Requests per hour"
             value={state.rateLimitRph}
             onChange={(e) => setState((s) => ({ ...s, rateLimitRph: e.target.value }))}
             placeholder="System default"
             className="mt-1.5 w-40 rounded-lg border-0 bg-(--color-bg-secondary) dark:bg-(--color-bg-tertiary) shadow-mac focus:ring-2 focus:ring-(--color-accent)/30 px-3 py-1.5 text-sm"
           />
         )}
+        <FieldError result={rphField(state)} />
       </div>
     </div>
   )
@@ -643,9 +751,18 @@ function CreateKeyForm({
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
+    if (!name.trim()) {
+      onError(KEY_NAME_ERROR)
+      return
+    }
+    const scopePayload = scopeStateToPayload(scope)
+    if (!scopePayload.ok) {
+      onError(scopePayload.error)
+      return
+    }
     setSubmitting(true)
     try {
-      const payload = { name, ...scopeStateToPayload(scope) }
+      const payload = { name: name.trim(), ...scopePayload.value }
       const key = await post<ApiKeyCreated>('/api/api-keys', payload)
       onCreated(key)
     } catch (e) {
@@ -696,23 +813,29 @@ function EditKeyModal({
   folders,
   onClose,
   onSaved,
-  onError,
 }: {
   apiKey: ApiKeyInfo
   topics: TopicCluster[]
   folders: WatchedFolderInfo[]
   onClose: () => void
   onSaved: () => void
-  onError: (msg: string) => void
 }) {
-  const [scope, setScope] = useState<ScopeFormState>(scopeStateFromKey(apiKey))
+  const [initialScope] = useState<ScopeFormState>(() => scopeStateFromKey(apiKey))
+  const [scope, setScope] = useState<ScopeFormState>(initialScope)
+  const [name, setName] = useState(apiKey.name)
+  // Shown inside the modal: the page's error banner sits behind the overlay.
+  const [saveError, setSaveError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [preview, setPreview] = useState<ScopePreview | null>(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const debounceRef = useRef<number | null>(null)
 
-  // Memo the payload object; use its JSON string as a stable effect dep key
-  const scopePayload = useMemo(() => scopeStateToPayload(scope), [scope])
+  // Memo the preview inputs; use their JSON string as a stable effect dep key. The
+  // preview needs only tier and document scope, never the snippet cap (which may be invalid mid-edit).
+  const scopePayload = useMemo(
+    () => ({ permission_tier: scope.tier, scope_topic_ids: scope.topicIds, scope_folder_ids: scope.folderIds }),
+    [scope.tier, scope.topicIds, scope.folderIds],
+  )
   const payloadKey = useMemo(() => JSON.stringify(scopePayload), [scopePayload])
 
   // Debounced live scope preview: POST unsaved scope params to get real-time
@@ -743,12 +866,22 @@ function EditKeyModal({
   }, [apiKey.key_id, payloadKey, scopePayload])
 
   async function handleSave() {
+    setSaveError('')
+    const changed = changedFields(name, apiKey.name, scope, initialScope)
+    if (!changed.ok) {
+      setSaveError(changed.error)
+      return
+    }
+    if (Object.keys(changed.value).length === 0) {
+      onClose() // nothing changed: nothing to send
+      return
+    }
     setSubmitting(true)
     try {
-      await patch(`/api/api-keys/${apiKey.key_id}`, scopeStateToPayload(scope))
+      await patch(`/api/api-keys/${apiKey.key_id}`, changed.value)
       onSaved()
     } catch (e) {
-      onError(e instanceof Error ? e.message : 'Save failed')
+      setSaveError(e instanceof Error ? e.message : 'Save failed')
     } finally {
       setSubmitting(false)
     }
@@ -773,6 +906,17 @@ function EditKeyModal({
           </button>
         </div>
 
+        <div className="mb-4">
+          <label className="mb-1 block text-xs font-medium text-gray-700 dark:text-gray-300">Key Name</label>
+          <input
+            type="text"
+            aria-label="Key name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="w-full rounded-lg border-0 bg-(--color-bg-secondary) dark:bg-(--color-bg-tertiary) shadow-mac focus:ring-2 focus:ring-(--color-accent)/30 px-3 py-1.5 text-sm"
+          />
+        </div>
+
         <ScopeFormFields state={scope} setState={setScope} topics={topics} folders={folders} />
 
         <div className="mt-4 rounded-lg bg-(--color-bg-secondary) dark:bg-(--color-bg-tertiary) p-3 text-xs">
@@ -787,6 +931,15 @@ function EditKeyModal({
             <span className="text-gray-500 dark:text-gray-400">Scope preview unavailable.</span>
           )}
         </div>
+
+        {saveError && (
+          <div
+            role="alert"
+            className="mt-4 rounded-sm bg-red-50 dark:bg-red-900/20 px-3 py-2 text-sm text-red-700 dark:text-red-400"
+          >
+            {saveError}
+          </div>
+        )}
 
         <div className="mt-5 flex justify-end gap-3">
           <button
