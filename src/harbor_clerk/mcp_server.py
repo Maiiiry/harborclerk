@@ -34,7 +34,14 @@ from harbor_clerk.models import (
     IngestionJob,
 )
 from harbor_clerk.oauth import validate_access_token as validate_oauth_access_token
-from harbor_clerk.passage_cap import cap_passage_text, cap_text, snippet_cap
+from harbor_clerk.passage_cap import (
+    SnippetCapRefusal,
+    cap_passage_text,
+    cap_text,
+    refuse_filter_past_cap,
+    snippet_cap,
+)
+from harbor_clerk.payload_bounds import HINT_MAX_CHARS, HINT_VALUE_MAX_CHARS, bound_metadata, bound_summary
 from harbor_clerk.search import (
     FindAllHit,
     FindAllResult,
@@ -336,6 +343,47 @@ def _human_session() -> bool:
     """
     principal = _mcp_principal.get()
     return principal is not None and is_human(principal)
+
+
+def _bounded_summary(summary: str | None, principal: Principal) -> str | None:
+    """A summary in a tool payload: the key's snippet cap, then the size bound (#831).
+
+    Bounded for every caller, the human's in-process chat and research tools included: the payload
+    lands in a model's context either way (``payload_bounds``)."""
+    return bound_summary(summary, snippet_cap(principal), bounded=True)
+
+
+def _filter_refusal(metadata_filter: dict | None, principal: Principal) -> str | None:
+    """Why a capped key may not send this ``metadata_filter`` (a string longer than its cap), or None.
+
+    ``hybrid_search`` refuses the same filter (REST answers 422); a tool says so as its result."""
+    try:
+        refuse_filter_past_cap(metadata_filter, snippet_cap(principal))
+    except SnippetCapRefusal as exc:
+        return str(exc)
+    return None
+
+
+def _text_contains_scope(text_contains: str | None, principal: Principal) -> dict:
+    """For a capped key that sent ``text_contains``, a note on where the literal is matched (#831).
+
+    Present on every such response, matching or not, so it says nothing about the result: an empty
+    result then reads as "not in the first N characters", not "not in the corpus"."""
+    cap = snippet_cap(principal)
+    if text_contains is None or cap is None:
+        return {}
+    if cap == 0:
+        note = (
+            "This API key's snippet cap is 0, so text_contains matches no text: only an all-whitespace "
+            "literal, which matches every passage, passes."
+        )
+    else:
+        note = (
+            f"text_contains is matched only within the first {cap} characters of each passage "
+            "(this API key's snippet cap); a literal further in is not found, and a word ending exactly at "
+            "the cap counts as whole for a word-boundary match."
+        )
+    return {"text_contains_scope": note}
 
 
 def _error_text(text: str | None) -> str | None:
@@ -867,7 +915,11 @@ async def kb_search(
       - `discriminator_hint` (when present): top hits span multiple docs that differ on
         a structured metadata field. Use `metadata_filter` with the suggested key/value
         to pin the right doc. The hint includes `ambiguous_doc_titles`,
-        `differing_metadata` (per-doc values), and a `suggestion` string.
+        `differing_metadata` (per-doc values keyed by title; titles shared by
+        two candidates appear as "Title [8hex]", from the doc_id), and a
+        `suggestion` string. Values are size-bounded; `differing_metadata`
+        may carry `_truncated`: a list of {"field", "doc_id", "at"?} for each
+        value cut or entry dropped, ending with {"more": N} when long.
 
     When to iterate:
       - One query returned ambiguous results across multiple docs → call `kb_batch_search`
@@ -906,7 +958,9 @@ async def kb_search(
         Document.metadata. Use to disambiguate when multiple candidate docs share
         text but differ on a structured field. Example:
         metadata_filter={"sidecar.vendor": "Acme", "sidecar.term_months": 24}.
-        Inspect a document's available metadata via kb_get_document.
+        Inspect a document's available metadata via kb_get_document. A value
+        must be the whole stored value: one shown cut (ending in "…", or at
+        the key's snippet cap) matches nothing.
         Additionally accepts the `email.*` namespace for native Document
         column lookups (faster + typed vs. raw tika.email_* via JSONB):
           email.from_address (exact, case-insensitive)
@@ -917,6 +971,14 @@ async def kb_search(
           email.thread_id / email.message_id (exact)
         For date filtering on emails, use the after=/before= filters
         (already mapped to email_date_sent for emails).
+        Mail headers (sender, recipients, cc, subject, message and thread
+        ids, date) are envelope fields outside the snippet cap: every
+        email.* key is accepted at any length (the header block opening a
+        message's first passage is still passage text, capped). Under a
+        key with a cap of N:
+        a strict ISO date on tika.created_at,
+        frontmatter.date or sidecar.date is accepted; any other string
+        longer than N is refused (every string at a cap of 0).
 
     detail levels control how much text is returned per hit:
       "full" (default): complete chunk text — best for reading a small
@@ -929,8 +991,9 @@ async def kb_search(
         understand score distribution and document coverage before narrowing down
       Under an API key with a snippet cap of N characters, a hit's text is the
       chunk's first N characters at every detail level (none at a cap of 0).
-      The cap applies to passage text only: titles, metadata and whether a
-      text_contains literal matched are returned as usual.
+      Under the cap, text_contains matches only within each chunk's first N
+      characters and the discriminator hint's metadata values are cut to
+      their first N; the query itself is still ranked against whole chunks.
 
     faceted: if true, groups hits by document with per-document top_score
       and hit_count — useful for understanding which documents are most
@@ -944,9 +1007,15 @@ async def kb_search(
       for a word boundary on that side: " IP " matches "the IP clause"
       and "IP." but not "ship". Special chars (% _) are matched
       literally. Combine with `query` for relevance ranking among the
-      literal-match subset.
+      literal-match subset. Under a key with a snippet cap of N, the
+      literal must occur within a chunk's first N characters (a word
+      ending exactly at N counts as whole), and the response's
+      text_contains_scope says so.
     """
     principal = _get_principal()
+    if (refusal := _filter_refusal(metadata_filter, principal)) is not None:
+        return json.dumps({"error": refusal})
+    scope_note = _text_contains_scope(text_contains, principal)
     settings = get_settings()
 
     # Mutual exclusion check
@@ -1002,13 +1071,13 @@ async def kb_search(
                 resp_empty: dict = {"hits": [], "total_candidates": 0, "has_more": False}
                 if unscoped_count > 0:
                     resp_empty["would_match_unscoped"] = unscoped_count
-                return json.dumps(resp_empty, indent=2)
+                return json.dumps({**resp_empty, **scope_note}, indent=2)
             if did is not None and did not in visible_ids:
-                return json.dumps({"hits": [], "total_candidates": 0, "has_more": False}, indent=2)
+                return json.dumps({"hits": [], "total_candidates": 0, "has_more": False, **scope_note}, indent=2)
             if parsed_doc_ids is not None:
                 parsed_doc_ids = [d for d in parsed_doc_ids if d in visible_ids]
                 if not parsed_doc_ids:
-                    return json.dumps({"hits": [], "total_candidates": 0, "has_more": False}, indent=2)
+                    return json.dumps({"hits": [], "total_candidates": 0, "has_more": False, **scope_note}, indent=2)
             elif did is None:
                 parsed_doc_ids = list(visible_ids)
 
@@ -1025,13 +1094,15 @@ async def kb_search(
             mime_type=mime_type,
             metadata_filter=metadata_filter,
             text_contains=text_contains,
+            # A capped key's literal matches only within the prefix it can read (#831).
+            key_snippet_cap=snippet_cap(principal),
         )
         heading_map = await _resolve_headings(session, result.hits)
         source_context = await _source_context(session, [h.doc_id for h in result.hits])
         # Compute discriminator_hint if applicable. Cheap post-processing:
         # one indexed SELECT for top-K candidate docs' metadata. Skips when
         # fewer than 2 hits.
-        discriminator_hint = await _compute_discriminator_hint(result.hits, session)
+        discriminator_hint = await _compute_discriminator_hint(result.hits, session, snippet_cap(principal))
 
     # Resolve brief_chars for brief mode
     effective_brief_chars = brief_chars if brief_chars > 0 else settings.mcp_brief_chars
@@ -1125,6 +1196,7 @@ async def kb_search(
 
     if discriminator_hint is not None:
         resp["discriminator_hint"] = discriminator_hint
+    resp.update(scope_note)
 
     return json.dumps(resp, indent=2)
 
@@ -1176,7 +1248,10 @@ async def kb_find_all(
         tabs, line breaks or non-breaking spaces matches a single space.
         Leading or trailing whitespace asks for a word boundary on that
         side: " IP " matches "the IP clause" and "IP." but not "ship".
-        Special chars (% _) are matched literally.
+        Special chars (% _) are matched literally. Under a key with a
+        snippet cap of N, the literal must occur within a chunk's first N
+        characters, a word ending exactly at N counting as whole (the
+        response's text_contains_scope says so).
       max_results: cap on documents returned (default 100; server clamps
         at settings.find_all_max_results_cap, default 500).
       offset: pagination offset over the sorted result set. Default 0.
@@ -1208,6 +1283,14 @@ async def kb_find_all(
       email.thread_id / email.message_id (exact)
     For date filtering on emails, use the after=/before= filters
     (already mapped to email_date_sent for emails).
+    Mail headers (sender, recipients, cc, subject, message and thread
+    ids, date) are envelope fields outside the snippet cap: every
+    email.* key is accepted at any length (the header block opening a
+    message's first passage is still passage text, capped). Under a
+    key with a cap of N:
+    a strict ISO date on tika.created_at,
+    frontmatter.date or sidecar.date is accepted; any other string
+    longer than N is refused (every string at a cap of 0).
 
     Response:
       results: list of {doc_id, doc_title, mime_type, language, score,
@@ -1221,6 +1304,9 @@ async def kb_find_all(
       sort_by, presentation: echoed back
     """
     principal = _get_principal()
+    if (refusal := _filter_refusal(metadata_filter, principal)) is not None:
+        return json.dumps({"error": refusal})
+    scope_note = _text_contains_scope(text_contains, principal)
     settings = get_settings()
 
     # Mutual exclusion check
@@ -1277,6 +1363,7 @@ async def kb_find_all(
                         "truncated": False,
                         "sort_by": sort_by,
                         "presentation": presentation,
+                        **scope_note,
                     },
                     indent=2,
                 )
@@ -1290,6 +1377,7 @@ async def kb_find_all(
                         "truncated": False,
                         "sort_by": sort_by,
                         "presentation": presentation,
+                        **scope_note,
                     },
                     indent=2,
                 )
@@ -1305,6 +1393,7 @@ async def kb_find_all(
                             "truncated": False,
                             "sort_by": sort_by,
                             "presentation": presentation,
+                            **scope_note,
                         },
                         indent=2,
                     )
@@ -1365,6 +1454,7 @@ async def kb_find_all(
         "truncated": result.truncated,
         "sort_by": result.sort_by,
         "presentation": result.presentation,
+        **scope_note,
     }
     return json.dumps(resp, indent=2)
 
@@ -1424,6 +1514,8 @@ async def kb_batch_search(
     characters, as in kb_search.
     """
     principal = _get_principal()
+    if (refusal := _filter_refusal(metadata_filter, principal)) is not None:
+        return json.dumps({"error": refusal})
     settings = get_settings()
 
     # Validate query count
@@ -1504,6 +1596,7 @@ async def kb_batch_search(
                 language=language,
                 mime_type=mime_type,
                 metadata_filter=metadata_filter,
+                key_snippet_cap=snippet_cap(principal),
             )
             heading_map = await _resolve_headings(session, result.hits)
             source_context = await _source_context(session, [h.doc_id for h in result.hits])
@@ -1518,7 +1611,7 @@ async def kb_batch_search(
                 snippet_cap(principal),
             )
             resp["query"] = query
-            hint = await _compute_discriminator_hint(result.hits, session)
+            hint = await _compute_discriminator_hint(result.hits, session, snippet_cap(principal))
             if hint is not None:
                 resp["discriminator_hint"] = hint
             results.append(resp)
@@ -1742,8 +1835,18 @@ async def kb_get_document(doc_id: str) -> str:
       - `metadata`: the document's structured metadata extracted at ingest
         (sidecar facts, Tika fields, frontmatter, etc.). The keys here are
         EXACTLY the filter keys you can pass to kb_search via metadata_filter
+        (and, where shown whole, the values: see the size bounds below)
         — e.g. `metadata.sidecar.vendor` becomes
         `metadata_filter={"sidecar.vendor": "..."}`
+      - Size bounds: a string value over 1,000 characters and a summary over
+        1,500 end in "…"; metadata over 4,000 characters of JSON keeps the
+        entries that fit. `metadata._truncated` lists every path cut or
+        dropped as a dotted string ("sidecar.notes", "sidecar.parties[0].name"),
+        ending with "+N more" when long. Under a key with a snippet cap of N, the summary and every
+        metadata string are their first N characters (none at a cap of 0).
+        A cut value (listed in `_truncated`, or N characters long under a
+        cap) is NOT a metadata_filter value: the filter matches the whole
+        stored value only, so pass only values shown whole.
 
     When to use it:
       - You want to inspect what filter keys exist on a doc before crafting
@@ -1788,12 +1891,13 @@ async def kb_get_document(doc_id: str) -> str:
         "title": doc.title,
         "status": doc.status,
         "pipeline_status": doc.pipeline_status.value if doc.pipeline_status else None,
-        "summary": doc.summary,
+        "summary": _bounded_summary(doc.summary, principal),
         "mime_type": doc.mime_type,
         "size_bytes": doc.size_bytes,
         "extracted_chars": doc.extracted_chars,
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
-        "metadata": doc.doc_metadata,
+        # The key's snippet cap on every string value, then the size bound for every caller (#831).
+        "metadata": bound_metadata(doc.doc_metadata, snippet_cap(principal), bounded=True, depth=1),
         "jobs": jobs,
     }
     if doc.error:
@@ -1848,7 +1952,7 @@ async def kb_list_recent(limit: int = 20) -> str:
         item = {
             "doc_id": str(doc.doc_id),
             "title": doc.title,
-            "summary": doc.summary,
+            "summary": _bounded_summary(doc.summary, principal),
             "status": doc.status,
             "pipeline_status": doc.pipeline_status.value if doc.pipeline_status else None,
             "updated_at": doc.updated_at.isoformat(),
@@ -1993,7 +2097,7 @@ async def kb_corpus_overview(limit: int = 50) -> str:
         item = {
             "doc_id": str(doc.doc_id),
             "title": doc.title,
-            "summary": doc.summary,
+            "summary": _bounded_summary(doc.summary, principal),
             "pipeline_status": doc.pipeline_status.value if doc.pipeline_status else None,
             "updated_at": doc.updated_at.isoformat(),
         }
@@ -2311,7 +2415,7 @@ async def kb_find_related(doc_id: str, k: int = 5) -> str:
         item = {
             "doc_id": str(rid),
             "title": rdoc.title,
-            "summary": rdoc.summary,
+            "summary": _bounded_summary(rdoc.summary, principal),
             "similarity": similarity,
             "source": source,
             "doc_type": rdoc.doc_type,
@@ -2436,6 +2540,11 @@ async def kb_entity_search(
                 }
                 for e in rows
             ]
+            if snippet_cap(principal) is not None:
+                # An exact string at an offset places text past the key's cap in the chunk: a capped
+                # key keeps the entity's text and loses where it sits (#831).
+                for entity in entities:
+                    del entity["start_char"], entity["end_char"]
 
     return json.dumps(
         {
@@ -2849,7 +2958,9 @@ async def kb_verify_identifier(identifier: str) -> str:
       - status="unique": one match — its doc_id, title, canonical_filename
       - status="ambiguous": multiple matches — each candidate carries
         discriminating_fields (the metadata that distinguishes them) and
-        a suggestion for how to pick one
+        a suggestion for how to pick one. Values are size-bounded; a
+        candidate's discriminating_fields may carry `_truncated`, dotted
+        paths of what was cut or dropped (as kb_get_document's metadata)
 
     When the response is ambiguous, the discriminating_fields per candidate
     tell you what differs — pick the one matching the user's intent, or ask
@@ -2862,6 +2973,9 @@ async def kb_verify_identifier(identifier: str) -> str:
         as this one. A question about content is still answerable: search
         for the subject and the parties with kb_search and present what you
         find under its own title, not as the document the user named.
+        Under a key with a snippet cap, identifiers held only in metadata
+        longer than the cap are not checked: not_found then means "not
+        found", not "does not exist", and its instruction says so.
       - status="ambiguous" with no discriminating_fields means the
         candidates are indistinguishable by metadata; inspect with
         kb_get_document if you must.
@@ -2872,7 +2986,9 @@ async def kb_verify_identifier(identifier: str) -> str:
         # chat must not resolve, or learn the title of, a document in a folder outside its scope. The set is
         # applied inside the lookup, before its caps, not to the result.
         visible_ids = await _visible_doc_ids(session, principal)
-        result = await _verify_identifier_impl(session, identifier, doc_ids=visible_ids)
+        result = await _verify_identifier_impl(
+            session, identifier, doc_ids=visible_ids, key_snippet_cap=snippet_cap(principal)
+        )
         payloads: list[dict] = []
         if isinstance(result, dict):
             if isinstance(result.get("match"), dict):
@@ -2881,15 +2997,36 @@ async def kb_verify_identifier(identifier: str) -> str:
             if isinstance(candidates, list):
                 payloads.extend(candidate for candidate in candidates if isinstance(candidate, dict))
         source_context = await _source_context(session, _valid_doc_ids_from_payloads(payloads))
+        cap = snippet_cap(principal)
         for payload in payloads:
             _enrich_doc_payload_with_source(payload, source_context)
+            # Metadata values: the key's snippet cap, then the hint bound for every caller (#831).
+            if isinstance(payload.get("discriminating_fields"), dict):
+                payload["discriminating_fields"] = bound_metadata(
+                    payload["discriminating_fields"],
+                    cap,
+                    bounded=True,
+                    value_max=HINT_VALUE_MAX_CHARS,
+                    total_max=HINT_MAX_CHARS,
+                )
     # Response-level anti-hedge directive for the not_found case. The docstring
     # already says "do NOT fall back to closest match", but the BEFORE/AFTER on
     # PR-J showed frontier models reproduce the exact padding the docstring
     # forbids ("the closest proxy is..."). The directive lands harder when it's
     # in the tool RESULT the model is reading at decision time, not in the
     # tools/list description it saw at session start.
-    if isinstance(result, dict) and result.get("status") == "not_found":
+    if isinstance(result, dict) and result.get("status") == "not_found" and cap is not None:
+        # A capped key does not check identifiers held only in metadata longer than its cap (#831), so
+        # "it does not exist" could be false. Every capped not_found says so, whether or not a match was
+        # left unchecked, so the wording reveals nothing about the corpus.
+        result["instruction"] = (
+            "No document matched among the fields this API key may check: titles, filenames, and metadata "
+            "identifiers within its snippet cap. Identifiers held only in longer metadata are not checked, so "
+            "tell the user it was not found, not that it does not exist. Do NOT present a similar or adjacent "
+            "document as this one. If the question is about content, answer it with kb_search on the subject "
+            "and the parties, and present what you find under its own title."
+        )
+    elif isinstance(result, dict) and result.get("status") == "not_found":
         result["instruction"] = (
             "No document carries this identifier, exactly or by its words: it does not exist in the corpus. "
             "State that plainly to the user. "
@@ -2951,6 +3088,14 @@ async def kb_documents_by_date(
           email.thread_id / email.message_id (exact)
         For date filtering on emails, use the after=/before= filters
         (already mapped to email_date_sent for emails).
+        Mail headers (sender, recipients, cc, subject, message and thread
+        ids, date) are envelope fields outside the snippet cap: every
+        email.* key is accepted at any length (the header block opening a
+        message's first passage is still passage text, capped). Under a
+        key with a cap of N:
+        a strict ISO date on tika.created_at,
+        frontmatter.date or sidecar.date is accepted; any other string
+        longer than N is refused (every string at a cap of 0).
       after, before: ISO 8601 date or datetime strings; bound the
         effective-date range.
       date_field: explicit override for the effective-date source. Accepted
@@ -2982,6 +3127,7 @@ async def kb_documents_by_date(
             date_field=date_field,
             limit=limit,
             doc_ids=visible_ids,
+            key_snippet_cap=snippet_cap(principal),
         )
         rows = result.get("results") if isinstance(result, dict) else None
         if isinstance(rows, list):

@@ -874,8 +874,11 @@ function ScopeFormFields({
           <FieldError result={parsedCap} />
         ) : (
           <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-            Passage and page text the key receives is cut to its first N characters; 0 returns citations without passage
-            text. Titles, summaries and metadata are not capped. Empty = no limit.
+            Passage and page text, summaries and metadata values the key receives are cut to their first N characters, a
+            literal-text filter matches only within them, and a metadata filter value longer than N is refused; 0
+            returns citations without the text. Ranked search still matches the whole document, so results can show that
+            words occur past the cap. Titles, dates and mail headers (sender, recipients, subject, ids) are outside the
+            cap. Empty = no limit.
           </p>
         )}
       </div>

@@ -13,11 +13,22 @@ should check `"discriminator_hint" in response` rather than truthiness.
 from __future__ import annotations
 
 import uuid
+from collections import Counter
 from typing import Any
 
 from sqlalchemy import select
 
 from harbor_clerk.models import Document
+from harbor_clerk.payload_bounds import (
+    HINT_VALUE_MAX_CHARS,
+    METADATA_MAX_CHARS,
+    SUGGESTION_MAX_CHARS,
+    bound_metadata,
+    cap_values,
+    dotted,
+    escaped_len,
+    shorten,
+)
 
 # Internal namespace key written by the metadata extractor framework.
 # Per-source timestamps always differ across docs, so excluding this
@@ -38,13 +49,20 @@ _MAX_FIELDS_IN_HINT = 3
 _COLLECTION_SUMMARY_FIRST_CHARS = 60
 
 
-async def _compute_discriminator_hint(hits, session) -> dict | None:
+async def _compute_discriminator_hint(hits, session, cap: int | None = None) -> dict | None:
     """Return a discriminator_hint dict if top hits are ambiguous on a
     structured metadata field, or None if no hint applies.
 
     `hits` is a list of SearchHit-shaped objects (must have `.doc_id`
     (str), `.doc_title` (str), `.score` (float)). `session` is a
     SQLAlchemy AsyncSession used for one SELECT against `documents.metadata`.
+    `cap` is the calling key's snippet cap (``passage_cap.snippet_cap``):
+    fields are compared, and every metadata string shown, as their first
+    `cap` characters (#831). For every caller the values are then
+    size-bounded (``payload_bounds``: ``HINT_VALUE_MAX_CHARS`` per value,
+    ``METADATA_MAX_CHARS`` for `differing_metadata`, `_truncated` listing
+    what was cut as `{field, doc_id}`). The suggestion names a filter only
+    for a field whose values are all shown whole.
     """
     if len(hits) < 2:
         return None
@@ -73,6 +91,9 @@ async def _compute_discriminator_hint(hits, session) -> dict | None:
 
     if len(candidates) < 2:
         return None
+    # The hint is keyed by title; replies and copies share titles, so colliding ones are disambiguated
+    # by doc id and every candidate keeps its own entry.
+    labels = candidate_labels(titles, candidates)
 
     # Fetch metadata for the candidates (one indexed lookup).
     result = await session.execute(
@@ -81,8 +102,13 @@ async def _compute_discriminator_hint(hits, session) -> dict | None:
     rows = result.all()
     metadata_by_doc: dict[str, dict] = {str(row.doc_id): (row.doc_metadata or {}) for row in rows}
 
-    # Find paths where the candidates have differing values.
-    differing = _find_differing_metadata_fields(candidates, metadata_by_doc, titles)
+    # Find paths where the candidates have differing values. Under a cap the values are compared as
+    # the key sees them: two values that share their first `cap` characters are one value to it, and
+    # calling them different would say they differ past the cap (#831).
+    compared = (
+        {did: cap_values(meta, cap) for did, meta in metadata_by_doc.items()} if cap is not None else metadata_by_doc
+    )
+    differing = _find_differing_metadata_fields(candidates, compared, labels)
     if not differing:
         return None
 
@@ -108,12 +134,116 @@ async def _compute_discriminator_hint(hits, session) -> dict | None:
         path: {t: _compact_value(v) for t, v in values_by_title.items()} for path, values_by_title in top_fields
     }
 
+    # The key's cap (already applied above), then the size bound. A `_truncated` entry names the
+    # field and the document by id: a title may contain dots, or be shared.
+    doc_id_by_label = {label: did for did, label in labels.items()}
+
+    def _describe(path: tuple) -> dict:
+        out: dict[str, Any] = {"field": path[0]}
+        if len(path) > 1:
+            out["doc_id"] = doc_id_by_label.get(path[1], path[1])
+        if len(path) > 2:
+            out["at"] = dotted(path[2:])
+        return out
+
+    bounded = bound_metadata(
+        compacted,
+        None,  # the cap is already in `compared` (with its ISO-date exemption); only the size bound here
+        bounded=True,
+        value_max=HINT_VALUE_MAX_CHARS,
+        total_max=METADATA_MAX_CHARS,
+        depth=4,  # indent=2, inside kb_batch_search's results[i].discriminator_hint (kb_search nests it at 2)
+        describe=_describe,
+        more=lambda n: {"more": n},
+    )
+    # metadata_filter is an exact match on the whole stored value, so a field is offered as a filter only
+    # when no candidate's value there is cut (by the bound or the cap), dropped by the size bound, or a
+    # list/dict, and then only its whole values are quoted. "Whole" is decided against what
+    # `differing_metadata` actually shows, so the hint and the suggestion cannot disagree. A candidate
+    # holding null there neither blocks the field nor is offered.
+    filterable: list[tuple[str, dict[str, Any]]] = []
+    blocked: dict[str, str] = {}
+    for path, _values in top_fields:
+        shown = bounded.get(path)
+        if not isinstance(shown, dict):
+            blocked[path] = "dropped by the size bound"
+            continue
+        kinds = {
+            did: _filter_kind(metadata_by_doc[did], compared[did], shown, labels[did], path)
+            for did in candidates
+            if did in metadata_by_doc
+        }
+        reasons = sorted(set(kinds.values()) - {"whole", "null"})
+        if reasons:
+            blocked[path] = " and ".join(reasons)
+            continue
+        offered = {labels[did]: _value_at(metadata_by_doc[did], path) for did, kind in kinds.items() if kind == "whole"}
+        if offered:
+            filterable.append((path, offered))
+
     return {
         "ambiguous_doc_ids": candidates,
         "ambiguous_doc_titles": [titles[d] for d in candidates],
-        "differing_metadata": compacted,
-        "suggestion": _build_suggestion(top_fields, titles),
+        "differing_metadata": bounded,
+        "suggestion": _build_suggestion(filterable, labels) if filterable else _no_filter_suggestion(blocked),
     }
+
+
+def candidate_labels(titles: dict[str, str], doc_ids: list[str]) -> dict[str, str]:
+    """A distinct label per candidate for keying per-document values: its title, or for a title two
+    candidates share, the title plus the first 8 hex digits of its doc id ("Contract [3f2a1b9c]").
+    Unique titles are left as they are, so the usual output shape does not change."""
+    counts = Counter(titles[d] for d in doc_ids)
+    labels = {d: titles[d] if counts[titles[d]] == 1 else f"{titles[d]} [{d[:8]}]" for d in doc_ids}
+    if len(set(labels.values())) < len(labels):  # a prefix or a real title still collides: use the whole id
+        labels = {d: titles[d] if counts[titles[d]] == 1 else f"{titles[d]} [{d}]" for d in doc_ids}
+    return labels
+
+
+def _value_at(metadata: dict, path: str) -> Any:
+    ns, _, key = path.partition(".")
+    ns_value = metadata.get(ns)
+    return ns_value.get(key) if isinstance(ns_value, dict) else None
+
+
+def _filter_kind(stored: dict, capped: dict, shown: dict, title: str, path: str) -> str:
+    """How a candidate's stored value at ``path`` serves as a ``metadata_filter`` value, judged against
+    ``shown``, the field's entry in the bounded ``differing_metadata`` ({title: value}), and ``capped``,
+    the candidate's metadata as the key sees it: "null" (null or absent), "not filterable" (a dict, or a
+    list holding one), "dropped by the size bound" (no entry for this candidate), "cut" (shown or seen
+    differently from what is stored: the hint bound, in escaped characters, or the key's cap, which
+    shows a string as null at 0), or "whole".
+
+    A list of scalars is filterable (``_apply_jsonb_metadata_filter`` matches it with ``@>``). The hint
+    shows it compacted, so it is whole when its entry is present, the key's cap left every element as
+    stored, and no string element is past the hint bound."""
+    value = _value_at(stored, path)
+    if value is None:
+        return "null"
+    if isinstance(value, list):
+        if not all(_is_scalar(v) for v in value):
+            return "not filterable"
+        if title not in shown:
+            return "dropped by the size bound"
+        too_long = any(isinstance(v, str) and escaped_len(v) > HINT_VALUE_MAX_CHARS for v in value)
+        return "cut" if too_long or _value_at(capped, path) != value else "whole"
+    if not _is_scalar(value):
+        return "not filterable"
+    if title not in shown:
+        return "dropped by the size bound"
+    if shown[title] != value:
+        return "cut"
+    return "whole"
+
+
+def _no_filter_suggestion(blocked: dict[str, str]) -> str:
+    fields = ", ".join(f"{path} ({reason})" for path, reason in blocked.items())
+    text = (
+        f"Top results are ambiguous; they differ on {fields}, so no value can be used as a metadata_filter, "
+        "which needs a whole stored value (a scalar, or a list of scalars). Pin one document with doc_id instead."
+    )
+    # Field names are stored keys of any length; this text quotes no filter value, so a cut is safe.
+    return shorten(text, SUGGESTION_MAX_CHARS)
 
 
 def _is_scalar(v: Any) -> bool:
@@ -207,12 +337,15 @@ def _build_suggestion(top_fields: list[tuple[str, dict[str, Any]]], titles: dict
     one concrete metadata_filter call. Prefers a value that uniquely pins
     a single doc when one exists; otherwise falls back to the first-iterated
     value and softens the claim to "narrow results".
+
+    The whole string stays within ``SUGGESTION_MAX_CHARS`` escaped characters: "Available values"
+    lists as many candidates as fit and says how many it left out, and a filter too long to quote at
+    all becomes a no-filter suggestion.
     """
     if not top_fields:
         return "Top results are ambiguous but no discriminating metadata fields found."
 
     path, values_by_title = top_fields[0]
-    available = ", ".join(f"{t}={v!r}" for t, v in values_by_title.items())
 
     # Count how often each value appears across candidates to prefer one that
     # uniquely pins a single doc.
@@ -227,14 +360,23 @@ def _build_suggestion(top_fields: list[tuple[str, dict[str, Any]]], titles: dict
         None,
     )
     if unique_value is not None:
-        return (
-            f"Top results are ambiguous. Use metadata_filter={{'{path}': {unique_value!r}}} "
-            f"to pin one doc. Available values: {available}."
-        )
+        head = f"Top results are ambiguous. Use metadata_filter={{'{path}': {unique_value!r}}} to pin one doc."
+    else:
+        # No value uniquely pins → soften the claim
+        first_value = next(iter(values_by_title.values()))
+        head = f"Top results are ambiguous. Use metadata_filter={{'{path}': {first_value!r}}} to narrow results."
 
-    # No value uniquely pins → soften the claim
-    first_value = next(iter(values_by_title.values()))
-    return (
-        f"Top results are ambiguous. Use metadata_filter={{'{path}': {first_value!r}}} "
-        f"to narrow results. Available values: {available}."
-    )
+    def compose(listed: list[str], omitted: int) -> str:
+        more = f"{', ' if listed else ''}{omitted} more not listed" if omitted else ""
+        return f"{head} Available values: {', '.join(listed)}{more}."
+
+    if escaped_len(compose([], len(values_by_title))) > SUGGESTION_MAX_CHARS:
+        return _no_filter_suggestion({path: "filter too long to quote"})
+    items = [f"{t}={v!r}" for t, v in values_by_title.items()]
+    listed: list[str] = []
+    for i, item in enumerate(items):
+        rest = len(items) - i - 1
+        if escaped_len(compose([*listed, item], rest)) > SUGGESTION_MAX_CHARS:
+            return compose(listed, len(items) - i)
+        listed.append(item)
+    return compose(listed, 0)

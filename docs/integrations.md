@@ -89,11 +89,88 @@ is refused to a key with a cap. A cap of 0 returns citations and metadata with
 the text fields null or absent. Leave the cap unset for no limit; negative values
 are rejected.
 
-The cap does not cover what is not passage text: document titles, summaries,
-metadata, headings and entity strings are returned as they are. Nor does it hide
-whether a `text_contains` literal occurs: a search with `text_contains` returns a
-chunk only if the chunk contains the literal, so a capped key can confirm that a
-phrase appears in a chunk without receiving the text around it.
+The cap bounds the text a key receives, and the filters that answer yes or no
+about text answer only about what the key can see (#831):
+
+- Summaries (`kb_get_document`, `kb_list_recent`, `kb_corpus_overview`,
+  `kb_find_related` and `GET /api/docs`, `/api/docs/overview`, `/api/docs/{id}`,
+  `/api/docs/{id}/related`) and every metadata string value (`kb_get_document`'s
+  `metadata`, the search `discriminator_hint`, `kb_verify_identifier`'s
+  `discriminating_fields`) are their first N characters, null at 0.
+- A `text_contains` filter (`kb_search`, `kb_find_all`, `POST /api/search`,
+  `/api/search/find-all`) matches only within each chunk's first N characters.
+  The MCP tools say so in a `text_contains_scope` note; the REST search routes
+  apply the same restriction without a note, so an empty REST result under a
+  cap may mean the literal lies past the cap.
+- A `metadata_filter` is an exact match on the whole stored value, so a string
+  value longer than N is refused (422 over REST, an `error` result over MCP) on
+  `kb_search`, `kb_batch_search`, `kb_find_all`, `kb_documents_by_date`,
+  `POST /api/search` and `/api/search/find-all`, and at a cap of 0 every string
+  filter is, and a null filter value too (every string shows as null at 0),
+  except a strict ISO date on a date field (see Dates below). Every `email.*`
+  filter is accepted at any cap and length (see Mail headers below).
+- `kb_verify_identifier` matches `tika.title` and metadata identifier fields only
+  against stored values within N (document titles and filenames still match).
+  It, and the search `discriminator_hint`, compare metadata values as the key
+  sees them; the hint suggests a filter only for values shown whole.
+- `kb_entity_search` returns entity strings without their `start_char` /
+  `end_char`.
+
+What the cap does not bound:
+
+- **Ranked search.** The `query` of `kb_search`, `kb_batch_search`, `kb_find_all`,
+  `kb_documents_by_date` and the REST search routes is matched against the whole
+  document, as ranking must be. Which documents come back, and a quoted phrase
+  query in particular, can indicate that words occur past the cap.
+- **Dates.** A strict ISO 8601 date or datetime sitting directly in
+  `tika.created_at`, `frontmatter.date` or `sidecar.date` (the value itself, or
+  an element of a list there) is structured data. The strict form is
+  `YYYY-MM-DD`, optionally followed by `T` or a space and `HH:MM`, `:SS`, up to
+  six fractional digits, and `Z` or `±HH:MM`. Under a cap,
+  `kb_get_document` returns such a date whole and a `metadata_filter` may name it
+  whatever its length, list elements included. `kb_documents_by_date` sorts,
+  filters (`after`, `before`, `date_field`) and reports only on a scalar date at
+  that path (never a list) and, under a cap, on nothing looser. Anything
+  else stored under those keys, such as `2024-01-15 08:00:00 PST` or a value
+  nested in a dict, is text: it is capped, refused as a filter past the cap, and
+  ignored by the date tool for a capped key. Uncapped callers keep the date
+  tool's wider reading, which takes any value that starts `YYYY-MM-DD`.
+- **Mail headers.** The sender, recipients, cc, subject, message and thread ids
+  and date of a message are envelope fields, like a title, stored in their own
+  columns: they are outside the snippet cap, and every `email.*` filter is
+  accepted for every key. The same holds for the headers Tika stored in
+  metadata for older messages (`tika.email_from`, `email_to`, `email_cc`,
+  `email_subject`, `email_date`), which citations fall back to: shown whole in
+  `kb_get_document` and accepted as filters under any cap. The header block at
+  the start of a message's first passage is passage text, and is capped like
+  the rest of it. Any surface that returns these fields to a key bounds them by
+  the RFC limits: an address at most 254 characters (RFC 5321), a message id,
+  subject or display name at most 998 (RFC 5322's line limit), and a To or Cc
+  list at most 10 addresses plus a count. Today a citation carries the display
+  sender (a name, bounded at 998, or an address, at 254) and the subject (998).
+- **Pipeline state.** Under any cap a key may learn that a summary exists (the
+  `summary_state` filter, `summary_model` and `summarize_job_status` on
+  `/api/docs`, the summarize stage in job lists): that is processing status. It
+  never receives a summary's text past the cap. A null `metadata_filter` is still
+  refused at a cap of 0, because whether a metadata field holds hidden text is
+  content.
+- Document titles, headings, and entity strings.
+
+Independently of any cap, every MCP tool result (and every REST response to a
+key) bounds summaries at 1,500 characters, each metadata string at 1,000 and a
+metadata payload at 4,000 characters of JSON. Each item is sized against one
+chat tool result at the smallest context a model runs at, and
+`kb_get_document`, which carries a summary and a metadata payload, fits one
+result whole. A list tool (`kb_list_recent`, `kb_corpus_overview`,
+`kb_find_related`, `kb_verify_identifier`) can exceed one result with many
+rows; the chat then drops whole rows from the end rather than cutting mid-JSON. Each surface counts in the unit
+it sends: an MCP tool result (and the chat and research tools in process) is
+escaped JSON, where every non-ASCII character takes six characters (`\uXXXX`),
+so the limits count escaped characters and indentation there; a REST response is
+UTF-8 JSON, so a REST summary's 1,500 characters are code points. A cut value ends in `…`, and the
+metadata carries a `_truncated` list of every path it shortened or dropped. A cut
+value is not a `metadata_filter` value: the filter needs the whole stored value.
+The web app's own sessions over REST receive summaries whole.
 
 If a skill or harness tries a tool outside its key scope, treat that as a
 recoverable scope mismatch. The agent should continue with search and passage

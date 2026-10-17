@@ -15,7 +15,7 @@ from harbor_clerk.config import get_settings
 from harbor_clerk.embedder_client import embed_texts_async
 from harbor_clerk.models import Chunk, Document, IngestionJob
 from harbor_clerk.models.enums import JobStage, JobStatus, PipelineStatus
-from harbor_clerk.passage_cap import cap_text
+from harbor_clerk.passage_cap import cap_text, refuse_filter_past_cap
 from harbor_clerk.search_rerank import rerank_hits
 from harbor_clerk.search_types import ConflictSource, FindAllHit, FindAllResult, SearchHit, SearchResult
 from harbor_clerk.text_contains import fold_whitespace, text_contains_clause
@@ -410,6 +410,7 @@ async def hybrid_search(
     mime_type: str | None = None,
     metadata_filter: dict[str, Any] | None = None,
     text_contains: str | None = None,
+    key_snippet_cap: int | None = None,
     summary_state: str | None = None,
     pipeline_status: str | None = None,
     job_stage: str | None = None,
@@ -417,10 +418,17 @@ async def hybrid_search(
     job_issue: str | None = None,
     bypass_reranker: bool = False,
 ) -> SearchResult:
-    """Run hybrid FTS + vector search, merge scores, return top K."""
+    """Run hybrid FTS + vector search, merge scores, return top K.
+
+    ``key_snippet_cap`` is the calling key's snippet cap (``passage_cap.snippet_cap``):
+    when set, ``text_contains`` matches only within each chunk's first that many characters, and a
+    ``metadata_filter`` string longer than the cap raises ``SnippetCapRefusal`` (a ValueError), so a
+    capped key cannot use either filter as an oracle on text past its cap (#831).
+    """
 
     if doc_id is not None and doc_ids is not None:
         raise ValueError("Cannot specify both doc_id and doc_ids")
+    refuse_filter_past_cap(metadata_filter, key_snippet_cap)
 
     # --- Scope filters ---
     scope_filters = []
@@ -433,7 +441,7 @@ async def hybrid_search(
     if text_contains is not None:
         # Whitespace-folded on both sides so a phrase matches across NBSPs and line breaks (#819);
         # the helper's left side is what ix_chunks_chunk_text_ws_trgm indexes.
-        scope_filters.append(text_contains_clause(Chunk.chunk_text, text_contains))
+        scope_filters.append(text_contains_clause(Chunk.chunk_text, text_contains, prefix_chars=key_snippet_cap))
 
     # Document-level filters — subquery on doc_ids
     # Always present, so the document subquery is always applied to both the
@@ -763,7 +771,8 @@ async def find_all(
     less omits both the snippet and its chunk id; in "full" the top chunk's text is cut to the chunk's first
     max(0, cap) characters (omitted at 0 or less). "full" sets the whole
     best chunk in the ``top_chunk_*`` fields instead and clamps the page to
-    ``_FIND_ALL_FULL_MAX_RESULTS`` documents.
+    ``_FIND_ALL_FULL_MAX_RESULTS`` documents. Under a cap, ``text_contains`` matches only within
+    each chunk's first ``cap`` characters (``hybrid_search``'s ``key_snippet_cap``).
     """
     _VALID_SORTS = {"relevance", "date_desc", "date_asc"}
     if sort_by not in _VALID_SORTS:
@@ -804,6 +813,8 @@ async def find_all(
         mime_type=mime_type,
         metadata_filter=metadata_filter,
         text_contains=text_contains,
+        # A capped key's text_contains answers only about the prefix it can read (#831).
+        key_snippet_cap=key_max_snippet_chars,
         summary_state=summary_state,
         pipeline_status=pipeline_status,
         job_stage=job_stage,

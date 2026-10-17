@@ -24,13 +24,15 @@ from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from sqlalchemy import case, cast, func, literal, null, or_, select
+from sqlalchemy import and_, case, cast, func, literal, null, or_, select
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from harbor_clerk.error_text import message_or_type
-from harbor_clerk.mcp_discriminator import _find_differing_metadata_fields
+from harbor_clerk.mcp_discriminator import _find_differing_metadata_fields, candidate_labels
 from harbor_clerk.models import Chunk, Document
+from harbor_clerk.passage_cap import ISO_DATE_PATTERN, refuse_filter_past_cap
+from harbor_clerk.payload_bounds import SUGGESTION_MAX_CHARS, cap_values, escaped_len
 from harbor_clerk.search import _apply_email_metadata_filter, _apply_jsonb_metadata_filter, websearch_tsquery
 from harbor_clerk.sql_escape import escape_ilike
 
@@ -82,7 +84,10 @@ def _iter_id_like_leaves(metadata: dict) -> list[Any]:
 
 
 async def _find_candidates(
-    session: AsyncSession, identifier: str, doc_ids: Collection[uuid.UUID] | None = None
+    session: AsyncSession,
+    identifier: str,
+    doc_ids: Collection[uuid.UUID] | None = None,
+    key_snippet_cap: int | None = None,
 ) -> list[Document]:
     """Return the set of active Documents matching `identifier` by any of:
       - title CONTAINS identifier (case-insensitive, whitespace-normalised)
@@ -98,6 +103,11 @@ async def _find_candidates(
     ``doc_ids`` (a scoped principal's visible set; None is unrestricted) restricts both passes in SQL, before
     the metadata pass's cap: filtering afterwards would let a hundred out-of-scope documents fill the cap and
     hide the one the caller may see (#724).
+
+    ``key_snippet_cap`` is the calling key's snippet cap (#831). The ``tika.title`` and metadata-leaf
+    equalities are tests on stored metadata text, so under a cap each matches only a stored value
+    within the cap, one the key sees whole (a guessed value past the cap is never confirmed), and at
+    a cap of 0 none. ``Document.title`` and filename matching are unchanged: titles are not capped.
     """
     normalized = _normalize(identifier)
     if not normalized:
@@ -110,6 +120,14 @@ async def _find_candidates(
     # The metadata-key match needs Python-side traversal because the leaf
     # paths are variable.
     pattern = f"%{escape_ilike(normalized)}%"
+    # JSONB ->> returns text; func.lower() gives true case-insensitive
+    # equality without wildcard semantics (normalized is already lowercase).
+    tika_title = Document.doc_metadata["tika"]["title"].astext
+    tika_match = func.lower(tika_title) == normalized
+    if key_snippet_cap is not None:
+        # tika.title is a metadata string (bound_metadata caps it; Document.title is not set from it):
+        # under a cap it matches only a stored value the key sees whole (#831).
+        tika_match = and_(tika_match, func.length(tika_title) <= max(0, key_snippet_cap))
     stmt = (
         select(Document)
         .where(Document.status == "active")
@@ -117,9 +135,7 @@ async def _find_candidates(
             or_(
                 Document.title.op("ILIKE")(pattern),
                 Document.canonical_filename.op("ILIKE")(pattern),
-                # JSONB ->> returns text; func.lower() gives true case-insensitive
-                # equality without wildcard semantics (normalized is already lowercase).
-                func.lower(Document.doc_metadata["tika"]["title"].astext) == normalized,
+                tika_match,
             )
         )
     )
@@ -143,6 +159,8 @@ async def _find_candidates(
         if doc.doc_id in sql_hit_ids:
             continue
         for raw in _iter_id_like_leaves(doc.doc_metadata or {}):
+            if key_snippet_cap is not None and isinstance(raw, str) and len(raw) > max(0, key_snippet_cap):
+                continue  # a value the key never sees whole: no match on it can be reported
             if isinstance(raw, str) and _normalize(raw) == normalized:
                 extra.append(doc)
                 break
@@ -265,7 +283,10 @@ def _has_nested_metadata(metadata_by_doc: dict[str, dict]) -> bool:
 
 
 async def verify_identifier(
-    session: AsyncSession, identifier: str, doc_ids: Collection[uuid.UUID] | None = None
+    session: AsyncSession,
+    identifier: str,
+    doc_ids: Collection[uuid.UUID] | None = None,
+    key_snippet_cap: int | None = None,
 ) -> dict:
     """Verify that an identifier resolves to a unique document, among those in ``doc_ids`` (a scoped
     principal's visible set; None is unrestricted).
@@ -291,7 +312,7 @@ async def verify_identifier(
     if not identifier or not identifier.strip():
         return {"error": "identifier must be a non-empty string"}
 
-    candidates = await _find_candidates(session, identifier, doc_ids)
+    candidates = await _find_candidates(session, identifier, doc_ids, key_snippet_cap)
     matched_by_words = False
     if not candidates:
         candidates = await _find_candidates_by_words(session, identifier, doc_ids)
@@ -318,9 +339,12 @@ async def verify_identifier(
 
     # Ambiguous — compute which metadata paths differ across candidates.
     titles = {str(d.doc_id): (d.title or str(d.doc_id)) for d in candidates}
-    metadata_by_doc = {str(d.doc_id): (d.doc_metadata or {}) for d in candidates}
+    # Under a cap, values are compared and projected as the key sees them (#831): two values that share
+    # their first `cap` characters are one value to it, and "candidates differ on X" would say otherwise.
+    metadata_by_doc = {str(d.doc_id): cap_values(d.doc_metadata or {}, key_snippet_cap) for d in candidates}
     candidate_ids = [str(d.doc_id) for d in candidates]
-    differing = _find_differing_metadata_fields(candidate_ids, metadata_by_doc, titles)
+    # Candidates sharing a title would overwrite each other in the per-title comparison; label them apart.
+    differing = _find_differing_metadata_fields(candidate_ids, metadata_by_doc, candidate_labels(titles, candidate_ids))
 
     cand_payload: list[dict] = []
     for d in candidates:
@@ -349,8 +373,20 @@ async def verify_identifier(
             "specific substring, or use kb_search(metadata_filter=...) to narrow."
         )
     elif differing:
-        field_list = ", ".join(differing.keys())
-        suggestion = f"{len(candidates)} candidates differ on {field_list} — pick the one matching your intent."
+        # Bounded like the discriminator's suggestion (#831): name fields while they fit, then a count.
+        fields = list(differing.keys())
+
+        def _differ_on(named: list[str], more: int) -> str:
+            tail = f"{', ' if named else ''}and {more} more" if more else ""
+            listed = f"{', '.join(named)}{tail}"
+            return f"{len(candidates)} candidates differ on {listed} — pick the one matching your intent."
+
+        named: list[str] = []
+        for i, field in enumerate(fields):
+            if escaped_len(_differ_on([*named, field], len(fields) - i - 1)) > SUGGESTION_MAX_CHARS:
+                break
+            named.append(field)
+        suggestion = _differ_on(named, len(fields) - len(named))
     elif _has_nested_metadata(metadata_by_doc):
         suggestion = (
             "Multiple candidates matched, but their distinguishing metadata is nested — "
@@ -401,7 +437,24 @@ def _safe_timestamp_cast(text_expr: Any) -> Any:
     )
 
 
-def _date_components() -> list[tuple[str, Any]]:
+def _strict_timestamp_cast(text_expr: Any) -> Any:
+    """Like ``_safe_timestamp_cast``, but only for a value ``passage_cap.is_structured_date`` accepts:
+    the same strict pattern, anchored, and ``pg_input_is_valid`` for the calendar (Python's
+    ``fromisoformat``). Used under a snippet cap (#831), so the date tool sorts, ranges and reports only
+    on dates the key also sees whole; anything looser is text, capped on display, and ignored here."""
+    return case(
+        (
+            and_(
+                text_expr.op("~")(f"^(?:{ISO_DATE_PATTERN})$"),
+                func.pg_input_is_valid(text_expr, "timestamptz"),
+            ),
+            cast(text_expr, TIMESTAMP(timezone=True)),
+        ),
+        else_=null(),
+    )
+
+
+def _date_components(strict: bool = False) -> list[tuple[str, Any]]:
     """Return (label, expr) tuples per priority slot.
 
     Expressions are built fresh per call — SQLAlchemy column elements are
@@ -412,9 +465,10 @@ def _date_components() -> list[tuple[str, Any]]:
     (e.g. Tika emitting "N/A") returns NULL and falls through to the next
     priority slot instead of raising an invalid_datetime_format error.
     """
-    tika_expr = _safe_timestamp_cast(Document.doc_metadata["tika"]["created_at"].astext)
-    fm_expr = _safe_timestamp_cast(Document.doc_metadata["frontmatter"]["date"].astext)
-    sc_expr = _safe_timestamp_cast(Document.doc_metadata["sidecar"]["date"].astext)
+    slot_cast = _strict_timestamp_cast if strict else _safe_timestamp_cast
+    tika_expr = slot_cast(Document.doc_metadata["tika"]["created_at"].astext)
+    fm_expr = slot_cast(Document.doc_metadata["frontmatter"]["date"].astext)
+    sc_expr = slot_cast(Document.doc_metadata["sidecar"]["date"].astext)
     ingest_expr = Document.created_at
     return [
         ("tika.created_at", tika_expr),
@@ -446,6 +500,7 @@ async def _query_documents_by_date(
     date_field: str | None = None,
     limit: int = 10,
     doc_ids: Collection[uuid.UUID] | None = None,
+    strict_dates: bool = False,
 ) -> list[tuple[Document, datetime, str]]:
     """Run the SQL query for documents_by_date and return rows.
 
@@ -461,7 +516,8 @@ async def _query_documents_by_date(
     if direction not in ("earliest", "latest"):
         raise ValueError(f"direction must be 'earliest' or 'latest'; got {direction!r}")
 
-    components = _date_components()
+    # strict_dates: a capped key's date tool uses only strict ISO dates (``_strict_timestamp_cast``).
+    components = _date_components(strict=strict_dates)
 
     # Build the effective-date expression + source-label CASE.
     if date_field is not None:
@@ -552,9 +608,11 @@ async def documents_by_date(
     date_field: str | None = None,
     limit: int = 10,
     doc_ids: Collection[uuid.UUID] | None = None,
+    key_snippet_cap: int | None = None,
 ) -> dict:
     """Return documents sorted by their effective date. ``doc_ids`` (a scope's visible set) restricts the
-    candidates before the sort; None is unrestricted.
+    candidates before the sort; None is unrestricted. ``key_snippet_cap`` is the calling key's snippet
+    cap: a ``metadata_filter`` string longer than it is refused (``passage_cap.refuse_filter_past_cap``).
 
     Response shape:
       {"direction": <input>, "count": N, "results": [
@@ -567,6 +625,7 @@ async def documents_by_date(
     string, or metadata_filter.
     """
     try:
+        refuse_filter_past_cap(metadata_filter, key_snippet_cap)
         rows = await _query_documents_by_date(
             session,
             direction=direction,
@@ -577,6 +636,7 @@ async def documents_by_date(
             date_field=date_field,
             limit=limit,
             doc_ids=doc_ids,
+            strict_dates=key_snippet_cap is not None,
         )
     except ValueError as exc:
         return {"error": message_or_type(exc)}
