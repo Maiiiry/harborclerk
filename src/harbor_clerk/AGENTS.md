@@ -119,11 +119,11 @@ outer deadline) compares against the next prompt as **predicted**
 (`_predict_prompt_tokens`): the server's exact `usage.prompt_tokens` of the
 last counted prompt, plus the messages appended since, weighted per message
 (`_predict_messages_tokens`: tool results and their calls at the model's tool
-ratio, prose and the schema at the model's prose ratio); with no count yet,
+ratio, prose and the schema at the prose ratio, as below); with no count yet,
 the whole prompt weighted the same way. Reading prose at the tool ratio
 trimmed a 16K history to 4 exchanges of 20 where the server takes 13; a
 constant prose weight let a 1.8x (CJK) history be refused on every turn. Both
-ratios are kept per model id for the life of the process (`_estimate_ratios`,
+ratios have per-model tables for the life of the process (`_estimate_ratios`,
 `_prose_ratios`). A refused first prompt is where a dense history is met: the
 loop records the prose density from the refusal's count and retries the turn
 once, trimmed against that count and the slot the refusal states; a refusal
@@ -131,9 +131,9 @@ once the turn has searched ends the search like the context budget, and the
 forced call's retry shrinks the results (the history trim would keep the
 latest tool row as the question); a first prompt refused twice is the error.
 An increment under `_INCREMENT_FLOOR_TOKENS` raw tokens is not measured.
-The prose table is per model while density is per conversation, so alternating
-languages oscillate it (EN/CJK/EN measured 1.20, 1.64, 1.72, 1.46, 1.62);
-per-conversation keying is #810.
+Prose is also kept per conversation (#810, `_conversation_prose_ratios`, in process,
+replaced per measurement), read first; dropped at the start of a turn whose loaded history
+holds a tool row; a searched turn reads the model's table; a prompt trimmed tool-less is measured.
 The tool ratio is measured only as the **increment** between two counted prompts
 of one turn's loop (the result and its call, nothing else): never from a
 tool-less prompt, never from a turn's first prompt even when the history holds
