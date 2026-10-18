@@ -153,7 +153,7 @@ stream carries, once, after it. A new estimate-derived figure takes the
 prediction or the weights; a new streamed call asks for usage, records it and
 tolerates the empty-choices chunk (`research.py`'s streaming reader does not
 ask for usage and still indexes `choices[0]`: asking without fixing the reader
-crashes it).
+crashes it). Orphan tool results 500 on gpt-oss: `_whole_tool_exchanges` (#839).
 
 ## Paths over MCP
 
