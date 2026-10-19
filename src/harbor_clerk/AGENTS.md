@@ -91,7 +91,7 @@ alone. A new model states its `checkpoint_bytes`, in the registry and in Swift. 
 (`Settings.swift`: filenames, slots, windows, `kvBytesPerToken`,
 `kvFixedBytes`, `MemoryBudget`) is held to the registry by a test; a new model
 needs all of them. `HC_GGUF_LIVE=1` checks headers from the Hub for models not
-downloaded.
+downloaded. **Docker Compose follows `LLM_MODEL_FILE`** (#654, gated on `config.is_compose()`): switching away from the served model, or deleting it, is refused; prompts are budgeted to `LLM_CONTEXT_TOKENS`; a summary waits at most 90 s per document. Details: [docs/architecture.md](../../docs/architecture.md#local-model-under-docker-compose).
 
 ## API keys over REST
 

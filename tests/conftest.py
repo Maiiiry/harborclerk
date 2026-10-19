@@ -129,6 +129,8 @@ os.environ["STORAGE_BACKEND"] = "filesystem"
 os.environ["STORAGE_PATH"] = "/tmp/harbor_clerk_test_storage"
 os.environ["SECRET_KEY"] = "test-secret-key-not-for-production"
 os.environ["STATIC_DIR"] = "/tmp/harbor_clerk_test_static"
+# Compose mode (#654) is for the compose file's services only; a test that wants it sets HC_DEPLOYMENT itself.
+os.environ["HC_DEPLOYMENT"] = ""
 
 # ruff: noqa: E402 — imports below MUST come after env setup (db.py reads settings at import time)
 from collections.abc import AsyncGenerator
