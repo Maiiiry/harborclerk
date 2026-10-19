@@ -414,24 +414,6 @@ def _humanize_retry_at(retry_after_iso: str | None, now: datetime) -> str | None
     return f"in about {minutes} minute{'s' if minutes != 1 else ''} ({clock})"
 
 
-def _job_age_seconds(now: datetime, job: IngestionJob) -> float | None:
-    started_at = job.started_at or job.created_at
-    if started_at is None:
-        return None
-    return (now - started_at).total_seconds()
-
-
-def _is_stuck_running_job(now: datetime, job: IngestionJob) -> bool:
-    if job.heartbeat_at is not None:
-        return (now - job.heartbeat_at).total_seconds() >= 90
-
-    from harbor_clerk.worker.pipeline import STAGE_CONFIG
-
-    _, timeout, _ = STAGE_CONFIG.get(job.stage, ("io", 600, PipelineStatus.error))
-    age = _job_age_seconds(now, job)
-    return age is not None and age >= timeout * 2
-
-
 @router.get("/system/status-summary")
 async def status_summary(
     _admin: Principal = Depends(require_admin),
@@ -652,7 +634,10 @@ async def status_summary(
         .scalars()
         .all()
     )
-    stuck_jobs = [job for job in running_jobs if _is_stuck_running_job(now, job)]
+    # The definition both reapers recover by, so "stuck" here is what "Recover stuck jobs" requeues.
+    from harbor_clerk.worker.pipeline import is_orphaned_running_job
+
+    stuck_jobs = [job for job in running_jobs if is_orphaned_running_job(now, job)]
 
     failed_docs = (
         (
@@ -1114,64 +1099,31 @@ async def reaper_run(
     admin: Principal = Depends(require_admin),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    """Find ingestion jobs stuck as running with stale heartbeat, re-enqueue them."""
-    from harbor_clerk.worker.pipeline import STAGE_CONFIG, enqueue_stage
+    """Requeue orphaned ingestion jobs (running, worker gone), as the background reaper does.
 
-    # Get all currently running jobs from DB
-    result = await session.execute(
-        select(IngestionJob)
-        .join(Document, Document.doc_id == IngestionJob.doc_id)
-        .where(
-            Document.status == "active",
-            IngestionJob.status == JobStatus.running,
-            IngestionJob.pipeline_seq == Document.pipeline_seq,
-        )
-    )
-    running_jobs = result.scalars().all()
+    Which jobs, and how, is ``worker/pipeline.py``'s (``requeue_orphaned_jobs``),
+    shared with the background reaper and the status summary's stuck count.
+    ``reaped`` counts the rows actually requeued.
+    """
+    from harbor_clerk.worker.pipeline import announce_requeued_jobs, requeue_orphaned_jobs
 
-    if not running_jobs:
-        return {"reaped": 0}
-
-    now = datetime.now(UTC)
-    orphans: list[tuple[uuid.UUID, JobStage]] = []
-    for job in running_jobs:
-        if job.heartbeat_at is not None:
-            # Worker has heartbeat — if stale > 90s, it's dead
-            stale = (now - job.heartbeat_at).total_seconds()
-            if stale < 90:
-                continue
-        else:
-            # Legacy: no heartbeat yet, use 2x timeout
-            _, timeout, _ = STAGE_CONFIG[job.stage]
-            if job.started_at is None:
-                continue
-            elapsed = (now - job.started_at).total_seconds()
-            if elapsed < timeout * 2:
-                continue
-
-        logger.warning(
-            "Reaping orphan job: doc=%s stage=%s heartbeat_at=%s",
-            job.doc_id,
-            job.stage.value,
-            job.heartbeat_at,
-        )
-        orphans.append((job.doc_id, job.stage))
-
-    # Commit any pending state and log audit before re-enqueuing
+    requeued = await requeue_orphaned_jobs(session, datetime.now(UTC))
+    reaped = len(requeued)
     await log_audit(
         session,
         user_id=admin.id,
         action="reaper_run",
-        detail={"reaped_count": len(orphans)},
+        detail={"reaped_count": reaped},
     )
     await session.commit()
+    try:
+        await asyncio.to_thread(announce_requeued_jobs, requeued)
+    except Exception:
+        # Committed: the jobs are queued and a worker claims them at its idle poll. Not a 500.
+        logger.exception("Reaper: announcing %d requeued jobs failed", reaped)
 
-    # Re-enqueue orphans (each creates its own sync session)
-    for doc_id, stage in orphans:
-        enqueue_stage(doc_id, stage)
-
-    logger.info("Reaped %d orphan jobs", len(orphans))
-    return {"reaped": len(orphans)}
+    logger.info("Reaped %d orphan jobs", reaped)
+    return {"reaped": reaped}
 
 
 @router.post("/system/repair-completed-statuses")

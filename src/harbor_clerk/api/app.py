@@ -157,39 +157,18 @@ async def _session_reaper_loop() -> None:
                     rs.status = "interrupted"
                     rs.error = "Research task stalled — no progress for 5+ minutes"
 
-                # Re-queue orphaned ingestion jobs (running with stale heartbeat >90s)
-                from harbor_clerk.models import Document, IngestionJob
-                from harbor_clerk.models.enums import JobStatus
-                from harbor_clerk.worker.pipeline import without_embed_retry_schedule
+                # Re-queue orphaned ingestion jobs (the worker died), as /system/reaper-run does
+                from harbor_clerk.worker.pipeline import announce_requeued_jobs, requeue_orphaned_jobs
 
-                heartbeat_cutoff = now - timedelta(seconds=90)
-                orphan_result = await db.execute(
-                    select(IngestionJob)
-                    .join(Document, Document.doc_id == IngestionJob.doc_id)
-                    .where(
-                        Document.status == "active",
-                        IngestionJob.status == JobStatus.running,
-                        IngestionJob.pipeline_seq == Document.pipeline_seq,
-                        IngestionJob.heartbeat_at < heartbeat_cutoff,
-                    )
-                )
-                orphan_jobs = orphan_result.scalars().all()
-                for job in orphan_jobs:
-                    logger.warning(
-                        "Reaper: re-queuing orphan job doc=%s stage=%s (heartbeat=%s)",
-                        job.doc_id,
-                        job.stage.value,
-                        job.heartbeat_at,
-                    )
-                    job.status = JobStatus.queued
-                    job.started_at = None
-                    job.heartbeat_at = None
-                    job.error = None
-                    # An orphan is not an embed deferred for an outage (#619):
-                    # drop any stale retry schedule so status stays truthful.
-                    job.metrics = without_embed_retry_schedule(job.metrics, job.stage)
+                orphan_jobs = await requeue_orphaned_jobs(db, now)
 
                 await db.commit()
+                try:
+                    await asyncio.to_thread(announce_requeued_jobs, orphan_jobs)
+                except Exception:
+                    # Committed: the jobs are queued and a worker claims them at its idle
+                    # poll. The rest of the pass (purges, topic refresh) still runs.
+                    logger.exception("Reaper: announcing %d re-queued orphan jobs failed", len(orphan_jobs))
                 total = len(stale_sessions) + len(done_sessions)
                 if total > 0 or stale_research or orphan_jobs:
                     logger.info(
