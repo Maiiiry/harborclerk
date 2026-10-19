@@ -179,7 +179,7 @@ def test_daemon_scans_existing_files_when_observer_registers(factory, tmp_path, 
 
 
 def test_scan_folder_writes_skipped_count_and_extensions(factory, tmp_path, monkeypatch):
-    """After _scan_folder visits a folder containing unsupported files,
+    """After _reconcile_folder visits a folder containing unsupported files,
     watched_folders.skipped_count and .skipped_extensions are updated.
     Dotfiles, AppleDouble, __MACOSX, and *.excalidraw.md are NOT counted.
 
@@ -226,7 +226,7 @@ def test_scan_folder_writes_skipped_count_and_extensions(factory, tmp_path, monk
     try:
         daemon = WatcherDaemon(factory)
         # Avoid spinning up real observers — only the scan logic is under test.
-        daemon._scan_folder(folder_id, str(tmp_path))
+        daemon._reconcile_folder(folder_id, str(tmp_path))
 
         sess = factory()
         try:
@@ -271,7 +271,7 @@ def test_scan_folder_records_no_extension_sentinel(factory, tmp_path, monkeypatc
 
     try:
         daemon = WatcherDaemon(factory)
-        daemon._scan_folder(folder_id, str(tmp_path))
+        daemon._reconcile_folder(folder_id, str(tmp_path))
 
         sess = factory()
         try:
@@ -324,12 +324,12 @@ def test_scan_folder_skips_sidecar_json_without_counting_it(factory, tmp_path, m
         dispatched: list[str] = []
         real_on_event = daemon._on_event
 
-        def _recording_on_event(event):
+        def _recording_on_event(event, **kwargs):
             dispatched.append(event.relative_path)
-            real_on_event(event)
+            return real_on_event(event, **kwargs)
 
         daemon._on_event = _recording_on_event
-        daemon._scan_folder(folder_id, str(tmp_path))
+        daemon._reconcile_folder(folder_id, str(tmp_path))
 
         # The scan classifies before dispatching so a sidecar costs no hash
         # and no round trip; handle_event would skip it, but must not be asked.
@@ -372,12 +372,14 @@ def test_scan_folder_retires_sidecar_rows_an_earlier_build_indexed(factory, tmp_
         daemon = WatcherDaemon(factory)
         # Rows as the earlier build left them: both files indexed.
         with monkeypatch.context() as m:
-            m.setattr(ev, "sidecar_owner_names", lambda _path, sibling_names=None: [])
+            m.setattr(ev, "sidecar_owner_names", lambda _path, *_args, **_kwargs: [])
             m.setattr(ev, "_retire_sidecar_row", lambda *_args: False)
-            daemon._scan_folder(folder_id, str(tmp_path))
+            daemon._reconcile_folder(folder_id, str(tmp_path))
         assert _watched_file_paths(factory, folder_id, WatchedFileStatus.active) == ["INV-001.json", "INV-001.pdf"]
 
-        daemon._scan_folder(folder_id, str(tmp_path))
+        # The same daemon: its stat cache skips the unchanged PDF, so the sidecar's
+        # own visit must retire it (a missed event leaves the same state).
+        daemon._reconcile_folder(folder_id, str(tmp_path))
 
         assert _watched_file_paths(factory, folder_id, WatchedFileStatus.active) == ["INV-001.pdf"]
         assert _watched_file_paths(factory, folder_id, WatchedFileStatus.removed) == ["INV-001.json"]
@@ -705,7 +707,7 @@ def test_startup_scan_canonicalizes_an_aliased_source_path(factory, tmp_path, mo
     try:
         assert _read(factory, doc_id) == (str(link / "doc.txt"), None)
 
-        WatcherDaemon(factory)._scan_folder(folder_id, str(real))
+        WatcherDaemon(factory)._reconcile_folder(folder_id, str(real))
 
         assert _read(factory, doc_id) == (str(real / "doc.txt"), b"on disk body")
     finally:
@@ -728,7 +730,7 @@ def test_startup_scan_heals_a_source_path_that_is_a_label(factory, tmp_path, mon
     try:
         assert _read(factory, doc_id) == (stored, None)
 
-        WatcherDaemon(factory)._scan_folder(folder_id, str(real))
+        WatcherDaemon(factory)._reconcile_folder(folder_id, str(real))
 
         assert _read(factory, doc_id) == (str(real / "doc.txt"), b"on disk body")
     finally:
@@ -748,7 +750,7 @@ def test_a_document_in_a_folder_stored_with_a_dot_dot_path_is_readable(factory, 
     folder_path = f"{tmp_path}/other/../real"
     folder_id = _commit_folder(factory, folder_path)
     try:
-        WatcherDaemon(factory)._scan_folder(folder_id, folder_path)
+        WatcherDaemon(factory)._reconcile_folder(folder_id, folder_path)
 
         sess = factory()
         try:
@@ -799,7 +801,7 @@ def test_startup_scan_re_extracts_a_doc_indexed_from_an_older_upload(factory, tm
     finally:
         sess.close()
     try:
-        WatcherDaemon(factory)._scan_folder(folder_id, str(real))
+        WatcherDaemon(factory)._reconcile_folder(folder_id, str(real))
 
         sess = factory()
         try:
@@ -836,7 +838,7 @@ def test_startup_scan_does_not_reprocess_a_current_doc(factory, tmp_path, monkey
     finally:
         sess.close()
     try:
-        WatcherDaemon(factory)._scan_folder(folder_id, str(real))
+        WatcherDaemon(factory)._reconcile_folder(folder_id, str(real))
 
         sess = factory()
         try:

@@ -10,6 +10,7 @@ import { IconTile } from '../components/IconTile'
 import EmailSection from '../components/EmailSection'
 import { watchedFoldersDockerGuideUrl } from '../data/docsLinks'
 import { useSystemConfig } from '../hooks/useSystemConfig'
+import { folderDeleteProtected, folderPillState, folderStatusLabel } from '../utils/watchedFolders'
 
 interface FolderInfo {
   folder_id: string
@@ -52,22 +53,12 @@ function errorMessage(e: unknown, fallback: string): string {
   return fallback
 }
 
-// Precedence: a disabled folder shouldn't show "scanning" or "processing" even
-// if a stale scan is in flight or jobs are still draining.
 function mapFolderStatusToPillState(f: FolderInfo, p?: ProgressInfo): PillState {
-  if (f.unavailable_reason) return 'error'
-  if (!f.enabled) return 'idle'
-  if (p?.scan_status === 'scanning' || p?.ingest_status === 'processing') return 'running'
-  return 'active'
+  return folderPillState(f, p)
 }
 
 function mapFolderStatusLabel(f: FolderInfo, p?: ProgressInfo): string {
-  if (f.unavailable_reason === 'unmounted') return 'unmounted'
-  if (f.unavailable_reason) return 'unavailable'
-  if (!f.enabled) return 'disabled'
-  if (p?.scan_status === 'scanning') return 'scanning'
-  if (p?.ingest_status === 'processing') return 'processing'
-  return 'idle'
+  return folderStatusLabel(f, p)
 }
 
 // Format the per-folder muted message that surfaces files the watcher
@@ -281,7 +272,7 @@ export default function FoldersPage() {
           {folders.map((f) => {
             const p = progress[f.folder_id]
             const isExpanded = expanded === f.folder_id
-            const deleteDisabled = f.auto_discovered && f.unavailable_reason === null
+            const deleteDisabled = folderDeleteProtected(f)
             const pendingDelete = pendingDeleteId === f.folder_id
             return (
               <FolderRow

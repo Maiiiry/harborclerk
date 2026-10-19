@@ -31,8 +31,10 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import fcntl
 import logging
 import os
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -146,7 +148,7 @@ def repaired_source_path(current: str | None, folder_path: str, relative_path: s
         inside = os.path.realpath(canonical).startswith(real_folder + os.sep)
     except (OSError, ValueError):
         inside = False
-    if not inside or not is_file_exact_case(canonical):
+    if not inside or not is_file_exact_case(canonical, folder_path):
         logger.warning("watched file %s is not present inside its folder; source_path left unchanged", relative_path)
         return None
     try:
@@ -183,21 +185,167 @@ _MISSING_SOURCE_ERRORS = frozenset(cls.__name__ for cls in (WatchedFileMissing, 
 _LEGACY_MISSING_SOURCE_PREFIX = "RuntimeError: No source for doc "
 
 
-def is_file_exact_case(path: str) -> bool:
-    """True when ``path`` is a regular file (a symlink to one counts) under exactly
-    that name. A dangling symlink or a directory is not.
+def _listed_name(names: list[str], name: str) -> str | None:
+    """The entry of ``names`` that is ``name`` exactly, compared NFC-normalised; None when there is none."""
+    if name in names:
+        return name
+    wanted = unicodedata.normalize("NFC", name)
+    return next((n for n in names if unicodedata.normalize("NFC", n) == wanted), None)
 
-    On a case-insensitive filesystem ``isfile`` also answers for a name that
-    differs only in case; the listing of the parent settles it.
-    """
+
+# macOS reports the path an open file has on disk, every component spelled as
+# stored, whatever spelling opened it. O_EVTONLY opens without read permission
+# and without keeping a volume from unmounting; O_NOFOLLOW makes a symlink leaf
+# fail, so it falls back to the listing.
+_F_GETPATH = getattr(fcntl, "F_GETPATH", None)
+_OPEN_FOR_PATH = getattr(os, "O_EVTONLY", os.O_RDONLY) | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def _on_disk_path(path: str) -> str | None:
+    """``path`` as the filesystem spells it (macOS ``F_GETPATH``); None where that cannot be read."""
+    if _F_GETPATH is None:
+        return None
     try:
-        # isfile first: listing the parent is O(entries), and only matters when
-        # isfile says yes (a case-insensitive match).
-        if not os.path.isfile(path):
+        fd = os.open(path, _OPEN_FOR_PATH)
+    except OSError:
+        return None
+    try:
+        return os.fsdecode(fcntl.fcntl(fd, _F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _nfc(name: str) -> str:
+    return unicodedata.normalize("NFC", name)
+
+
+def _no_other_spelling_resolves(current: str, parts: list[str]) -> bool:
+    """True when each component of ``parts`` below ``current`` exists and no other
+    spelling of it (case swapped, the other normal form) names the same file.
+
+    On a case- and normalisation-sensitive volume (Linux's ext4, CI) ``lstat``
+    succeeding is then the exact spelling; where another spelling resolves to the
+    same file, the volume ignores the difference and only a listing can tell.
+    """
+    for part in parts:
+        here = os.path.join(current, part)
+        try:
+            st = os.lstat(here)
+        except OSError:
             return False
-        return os.path.basename(path) in os.listdir(os.path.dirname(path) or ".")
+        for other in {part.swapcase(), _nfc(part), unicodedata.normalize("NFD", part)} - {part}:
+            try:
+                alias = os.lstat(os.path.join(current, other))
+            except OSError:
+                continue
+            if (alias.st_dev, alias.st_ino) == (st.st_dev, st.st_ino):
+                return False
+        current = here
+    return True
+
+
+def _spelled_as_given(path: str, current: str, parts: list[str]) -> bool:
+    """True when ``path`` is known, without listing a directory, to be spelled as on
+    disk in each of ``parts``; False when that cannot be told this way."""
+    on_disk = _on_disk_path(path)
+    if on_disk is not None:
+        tail = on_disk.split(os.sep)[-len(parts) :]
+        # A mismatch is not proof: a symlinked directory or another hard link
+        # reports another path. The listing settles it.
+        return len(tail) == len(parts) and all(_nfc(a) == _nfc(b) for a, b in zip(tail, parts, strict=True))
+    return _no_other_spelling_resolves(current, parts)
+
+
+def on_disk_name(path: str) -> str | None:
+    """The directory entry ``path`` opens, as spelled on disk; None when it is not a regular file.
+
+    On a case-insensitive volume ``report.json`` may open ``Report.json``. Read
+    without a listing where the spelling can be (macOS ``F_GETPATH``, or no other
+    spelling resolving on a sensitive volume); otherwise the directory is listed.
+    """
+    if not os.path.isfile(path):
+        return None
+    directory, name = os.path.dirname(path) or ".", os.path.basename(path)
+    on_disk = _on_disk_path(path)
+    if on_disk is not None:
+        # The stored name, unless the file was reached another way (a hard link
+        # elsewhere): then it must name this same file here too.
+        candidate = os.path.basename(on_disk)
+        if _same_entry(os.path.join(directory, candidate), path):
+            return candidate
+    elif _no_other_spelling_resolves(directory, [name]):
+        return name
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return name
+    if name in names:
+        return name
+    folded = _nfc(name).casefold()
+    return next(
+        (n for n in names if _nfc(n).casefold() == folded and _same_entry(os.path.join(directory, n), path)),
+        name,
+    )
+
+
+def _same_entry(a: str, b: str) -> bool:
+    try:
+        return os.path.samefile(a, b)
     except OSError:
         return False
+
+
+def is_file_exact_case(path: str, root: str | None = None) -> bool:
+    """True when ``path`` is a regular file (a symlink to one counts) under exactly
+    that spelling. A dangling symlink or a directory is not. The one presence check
+    for a watched file: the watcher's delete handling, the source_path repair and
+    the /watch routes all use it.
+
+    ``os.path.isfile`` alone answers yes for ``Invoices/Doc.pdf`` after a rename
+    to ``invoices/doc.pdf`` on a case-insensitive volume (APFS's default): it
+    resolves each component case-insensitively, which would keep a renamed-away
+    path alive beside the new one. So the name is looked up in its parent's
+    listing, and with ``root`` (the watched root, whose own spelling is the
+    folder's) every component of ``path`` below it is. Names are compared
+    NFC-normalised, since macOS may hand back either form, and the walk continues
+    under the name the listing holds. A ``path`` not under ``root`` has its leaf
+    checked only.
+
+    ``isfile`` goes first: a path that does not resolve to a file is answered
+    without listing anything, since listing a 20,000-entry directory per deleted
+    file made ``rm *.pdf`` cost minutes of serial work under the folder lock. A
+    path that does resolve is answered without a listing too where the spelling
+    can be read directly (``_spelled_as_given``: macOS's ``F_GETPATH``, or no
+    other spelling resolving on a sensitive volume): every move checks its
+    destination, and listing per file made `mv proj proj2023` with 8,000 files
+    cost 17 s. Only what that cannot settle is listed, per call, never cached
+    (a FAT or exFAT volume root's stat never changes, so no cache key is safe).
+
+    A file under a directory that cannot be listed (search permission without
+    read, mode 0311) cannot be settled; it counts as present, since guessing a
+    deletion would retire a live document.
+    """
+    if not os.path.isfile(path):
+        return False
+    prefix = root if root is None or root.endswith(os.sep) else root + os.sep
+    if prefix is not None and path.startswith(prefix) and len(path) > len(prefix):
+        current, parts = root, path[len(prefix) :].split(os.sep)
+    else:
+        current, parts = os.path.dirname(path) or ".", [os.path.basename(path)]
+    if _spelled_as_given(path, current, parts):
+        return True
+    for part in parts:
+        try:
+            names = os.listdir(current)
+        except OSError:
+            return True
+        name = _listed_name(names, part)
+        if name is None:
+            return False
+        current = os.path.join(current, name)
+    return os.path.isfile(current)
 
 
 def failed_for_a_missing_source(doc) -> bool:

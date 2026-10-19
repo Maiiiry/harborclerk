@@ -4,18 +4,21 @@ No watchdog imports, no I/O scheduling. Caller passes in synthetic FileEvent
 records; this module does the database work in the provided session. Caller
 is responsible for commit. It does read the filesystem: the event's file is
 hashed, an `.eml` is parsed, and a `.json` is judged a metadata sidecar or a
-document by listing its directory and reading it (`sidecar_owner_names`).
-Nothing under a watched folder is ever written, copied or moved.
+document by listing its directory and reading it (`sidecar_owner_names`), and
+a delete is checked against the disk before it is believed (an atomic save
+reports one for a file that exists). Nothing under a watched folder is ever
+written, copied or moved.
 """
 
 import hashlib
 import logging
 import os
 import posixpath
+import unicodedata
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
@@ -35,11 +38,18 @@ from harbor_clerk.models.watched import WatchedFile, WatchedFileStatus, WatchedF
 from harbor_clerk.watched_source import (
     failed_for_a_missing_source,
     is_file_exact_case,
+    on_disk_name,
     repaired_source_path,
     watched_state,
 )
+from harbor_clerk.watcher.relocate import apply_move, move_needs_reextract, sidecar_relative_path
+from harbor_clerk.watcher.visibility import restore_document, retire_watched_file
 
 logger = logging.getLogger(__name__)
+
+# How long a retired file's document waits to be adopted by a create of the
+# same content elsewhere in its folder (the second half of a split rename).
+ADOPT_WINDOW_SECS = 10.0
 
 # SHA-256 of empty content. Every 0-byte file produces this digest,
 # so it's NOT a unique fingerprint and must never be used as a dedup
@@ -53,6 +63,9 @@ class EventKind(str, Enum):
     created = "created"
     modified = "modified"
     deleted = "deleted"
+    # A rename or move inside the folder: ``relative_path`` is the source,
+    # ``dest_relative_path`` the destination.
+    moved = "moved"
 
 
 class SkipReason(str, Enum):
@@ -86,13 +99,22 @@ class FileEvent:
     folder_id: uuid.UUID
     relative_path: str
     absolute_path: str
+    dest_relative_path: str | None = None
+    dest_absolute_path: str | None = None
+    # A directory event. Only ``deleted`` is dispatched for one: every file
+    # the index holds under it that is no longer on disk is removed.
+    is_directory: bool = False
+    # The file's sha-256 when the caller has just computed it (a reconcile pass that
+    # hashed a new path to pair it); spares hashing it again. For a move, the destination's.
+    known_sha: bytes | None = None
 
 
 def classify_skip(
     relative_path: str,
     absolute_path: str | None = None,
     *,
-    sibling_names: Iterable[str] | None = None,
+    sibling_names: "Iterable[str] | SiblingIndex | None" = None,
+    sidecar_accepted: "Callable[[Path], bool] | None" = None,
 ) -> SkipReason | None:
     """Classify why ``relative_path`` would be skipped by the watcher.
 
@@ -106,7 +128,8 @@ def classify_skip(
     holds, so that check runs only when ``absolute_path`` is given; name-only
     callers (the API's extension validation) never see ``SIDECAR``. A caller
     that has already listed the directory passes ``sibling_names`` to spare
-    a listing per file.
+    a listing per file, and may pass ``sidecar_accepted`` to answer
+    ``load_sidecar`` from a cache (the reconcile keys it by the ``.json``'s stat).
     """
     parts = relative_path.split("/")
     if any(p == "__MACOSX" for p in parts):
@@ -120,47 +143,62 @@ def classify_skip(
     suffix = Path(relative_path).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         return SkipReason.UNSUPPORTED_EXTENSION
-    if absolute_path is not None and is_sidecar(absolute_path, sibling_names=sibling_names):
+    if absolute_path is not None and sidecar_owner_names(absolute_path, sibling_names, sidecar_accepted):
         return SkipReason.SIDECAR
     return None
 
 
-def is_sidecar(absolute_path: str, sibling_names: Iterable[str] | None = None) -> bool:
+def is_sidecar(absolute_path: str, sibling_names: "Iterable[str] | SiblingIndex | None" = None) -> bool:
     """True when ``absolute_path`` is a ``.json`` the extract stage would attach to a sibling document."""
     return bool(sidecar_owner_names(absolute_path, sibling_names))
 
 
-def sidecar_owner_names(absolute_path: str, sibling_names: Iterable[str] | None = None) -> list[str]:
+def sidecar_owner_names(
+    absolute_path: str,
+    sibling_names: "Iterable[str] | SiblingIndex | None" = None,
+    sidecar_accepted: "Callable[[Path], bool] | None" = None,
+) -> list[str]:
     """Names of the documents beside ``absolute_path`` that it is the sidecar of; empty when it is not one.
 
     Two conditions, the same two ``SidecarExtractor`` applies from the other
-    side: a file with exactly the same stem that the watcher would itself
-    admit sits beside it (``report.json`` beside ``report.exe`` is an
-    ordinary document), and ``load_sidecar`` accepts the contents (an
-    oversize, malformed, non-object or empty ``.json`` is an ordinary
-    document, because the extractor would decline it and it must not vanish
-    from both). A ``.json`` that no longer exists cannot be read, so it is
-    judged by its siblings here; ``handle_event`` then asks the database
+    side: a file the watcher would itself admit sits beside it whose sidecar,
+    as the extractor opens it (``Path(source).with_suffix(".json")``), is this
+    very file (``report.json`` beside ``report.exe`` is an ordinary document),
+    and ``load_sidecar`` accepts the contents (an oversize, malformed,
+    non-object or empty ``.json`` is an ordinary document, because the
+    extractor would decline it and it must not vanish from both). "This very
+    file" is decided on disk, as the extractor's open is: on a
+    case-insensitive volume ``report.txt`` reads ``Report.json``, so after
+    ``mv Report.txt report.txt`` the ``.json`` is still a sidecar, not a
+    duplicate document. A ``.json`` that no longer exists cannot be read, so
+    it is judged by exact name here; ``handle_event`` then asks the database
     whether it was read as a sidecar or indexed as a document. One listing
     and one read per call; the caller keeps the names.
     """
     path = Path(absolute_path)
-    if path.suffix != SIDECAR_SUFFIX:
+    if path.suffix.lower() != SIDECAR_SUFFIX:
         return []
     owners = _admitted_sibling_names(path, sibling_names)
     if not owners:
         return []
-    if path.exists() and load_sidecar(path, owner=absolute_path, quiet=True) is None:
-        return []
-    return owners
+    if not path.exists():
+        return owners
+    if sidecar_accepted is not None:
+        accepted = sidecar_accepted(path)
+    else:
+        accepted = load_sidecar(path, owner=absolute_path, quiet=True) is not None
+    return owners if accepted else []
 
 
-def _admitted_sibling_names(path: Path, names: Iterable[str] | None = None) -> list[str]:
-    """Files beside ``path`` with its exact stem that the watcher would admit, by name.
+def _admitted_sibling_names(path: Path, names: "Iterable[str] | SiblingIndex | None" = None) -> list[str]:
+    """Files beside ``path`` the watcher would admit whose extractor-side sidecar is ``path``.
 
-    Lists the directory unless ``names`` is given. A directory that cannot
-    be listed has no siblings: the ordinary path handles the file's own I/O
-    errors.
+    The exact name always counts (``INV-001.pdf`` reads ``INV-001.json``,
+    wherever). A name that differs only by case or normalisation counts when
+    the file exists and the sibling's ``<stem>.json`` resolves to it on disk,
+    which only a case- or normalisation-insensitive volume does. Lists the
+    directory unless ``names`` is given. A directory that cannot be listed
+    has no siblings: the ordinary path handles the file's own I/O errors.
     """
     if names is None:
         try:
@@ -168,21 +206,69 @@ def _admitted_sibling_names(path: Path, names: Iterable[str] | None = None) -> l
                 names = [entry.name for entry in entries if entry.is_file()]
         except OSError:
             return []
+    index = names if isinstance(names, SiblingIndex) else SiblingIndex(names)
+    exists: bool | None = None
     admitted = []
-    for name in names:
+    for name in index.candidates(path.stem):
         if name == path.name:
             continue
         sibling = Path(name)
-        if sibling.stem != path.stem or sibling.suffix == SIDECAR_SUFFIX:
+        if classify_skip(name) is not None:
             continue
-        if classify_skip(name) is None:
+        if sibling.stem == path.stem and path.suffix == SIDECAR_SUFFIX:
+            admitted.append(name)
+            continue
+        if exists is None:
+            exists = path.exists()
+        if exists and _same_file(path.parent / sibling.with_suffix(SIDECAR_SUFFIX), path):
             admitted.append(name)
     return admitted
 
 
-def _sidecar_relative_path(relative_path: str) -> str:
-    """The relative path ``SidecarExtractor`` would read for ``relative_path``."""
-    return posixpath.splitext(relative_path)[0] + SIDECAR_SUFFIX
+def _fold(name: str) -> str:
+    """A name as a case- and normalisation-insensitive volume compares it."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+class SiblingIndex:
+    """One directory's non-``.json`` file names, by folded stem: built once, looked up per ``.json``.
+
+    A reconcile classifies every file on every pass; scanning the whole
+    listing for each ``.json`` made a directory of 4,000 document/sidecar
+    pairs cost 32 million folds and some 40 s per pass. Building this is one
+    fold per name, and each lookup returns only the names whose stem folds the
+    same, which the ownership rule then checks exactly as before.
+    """
+
+    __slots__ = ("_by_stem",)
+
+    def __init__(self, names: Iterable[str]):
+        self._by_stem: dict[str, list[str]] = {}
+        for name in names:
+            sibling = Path(name)
+            if sibling.suffix.lower() == SIDECAR_SUFFIX:
+                continue
+            self._by_stem.setdefault(_fold(sibling.stem), []).append(name)
+
+    def candidates(self, stem: str) -> list[str]:
+        return self._by_stem.get(_fold(stem), [])
+
+
+def _same_file(a: Path | str, b: Path | str) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def sidecar_entry_on_disk(source_path: str) -> str | None:
+    """The directory entry the extract stage reads as ``source_path``'s sidecar, or None when there is none.
+
+    ``Path(source).with_suffix(".json")`` as the filesystem resolves it: on a
+    case-insensitive volume ``report.txt`` opens ``Report.json``, whose row
+    must then be found under that spelling.
+    """
+    return on_disk_name(str(Path(source_path).with_suffix(SIDECAR_SUFFIX)))
 
 
 def _should_ignore(relative_path: str) -> bool:
@@ -203,7 +289,7 @@ def _should_ignore(relative_path: str) -> bool:
     return classify_skip(relative_path) is not None
 
 
-def _sha256_of(path: str) -> bytes:
+def sha256_of(path: str) -> bytes:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -211,19 +297,63 @@ def _sha256_of(path: str) -> bytes:
     return h.digest()
 
 
+def file_exists_exact(base: str, relative_path: str) -> bool:
+    """``is_file_exact_case`` for ``relative_path`` below the watched root ``base``: every component's spelling."""
+    return is_file_exact_case(os.path.join(base, relative_path), base)
+
+
+def _event_base(event: "FileEvent") -> tuple[str, str]:
+    """The watched root and the path below it, as the event spells them.
+
+    An event's absolute path ends with its relative path (FSEvents may spell
+    the root as its real path). Should it not, only the leaf can be checked.
+    """
+    abs_path, rel = event.absolute_path, event.relative_path
+    suffix = os.sep + rel.replace("/", os.sep)
+    if abs_path.endswith(suffix):
+        return abs_path[: -len(suffix)] or os.sep, rel
+    return os.path.dirname(abs_path), os.path.basename(abs_path)
+
+
+def _exists_at_event(event: "FileEvent") -> bool:
+    return file_exists_exact(*_event_base(event))
+
+
 def handle_event(session: Session, event: FileEvent) -> None:
     """Apply a FileEvent to the database. Caller is responsible for commit."""
+    if event.kind == EventKind.moved:
+        _handle_moved(session, event)
+        return
+    if event.is_directory:
+        if event.kind == EventKind.deleted:
+            _handle_directory_deleted(session, event)
+        return
+    # Noise and unsupported files first: whatever their kind, they are dropped,
+    # so the disk checks below (an open and F_GETPATH under the folder lock)
+    # are spent only on files the watcher indexes.
     if _should_ignore(event.relative_path):
         logger.debug("watcher: ignored event for %s", event.relative_path)
         return
-
-    # An atomic save on macOS can end with a delete event for a file that is still
-    # there (the replaced inode's flag): marking it removed would make the document
-    # unreadable. A delete for a regular file present under that exact name is a
-    # modify; a dangling symlink or a directory in its place is a delete.
-    if event.kind == EventKind.deleted and is_file_exact_case(event.absolute_path):
-        logger.debug("watcher: delete event for %s, but the file is present; treated as a modify", event.relative_path)
+    if event.kind == EventKind.deleted and _exists_at_event(event):
+        # A delete for a file that is on disk is an atomic save (the old inode
+        # went, a new one was renamed into its place; macOS flags the replaced
+        # inode) or a delete followed by a re-create, reported in either order
+        # (#847). Marking it removed would make the document unreadable: the
+        # file's state is what is on disk now, so compare its content instead.
+        # Only a regular file under that exact spelling counts; a dangling
+        # symlink or a directory in its place is a delete.
+        logger.debug("watcher: %s reported deleted but exists; treating as modified", event.relative_path)
         event = replace(event, kind=EventKind.modified)
+    elif event.kind in (EventKind.created, EventKind.modified) and not _exists_at_event(event):
+        # Events are hints: a create or modify for a path that is not on disk
+        # under that exact spelling is about a file that is gone. A rename can
+        # arrive as two creates, the old name's first (after `mv Old new`, or a
+        # case-only `mv Old old`, which `isfile` would still answer for on a
+        # case-insensitive volume): retired here, its document is adopted by
+        # the other half (`_adopt_recently_retired`) instead of the old path
+        # being indexed beside the new one.
+        logger.debug("watcher: %s reported %s but is gone; treating as deleted", event.relative_path, event.kind.value)
+        event = replace(event, kind=EventKind.deleted)
 
     existing = (
         session.query(WatchedFile).filter_by(folder_id=event.folder_id, relative_path=event.relative_path).one_or_none()
@@ -254,11 +384,12 @@ def handle_event(session: Session, event: FileEvent) -> None:
         if existing is None or existing.status != WatchedFileStatus.active:
             return
 
-    # Delete events
+    # Delete events: the file is gone (checked above), so its document leaves
+    # search now, as `/watch/remove` does (#604); it comes back through the
+    # resurrect branches below if the file returns.
     if event.kind == EventKind.deleted:
         if existing is not None and existing.status == WatchedFileStatus.active:
-            existing.status = WatchedFileStatus.removed
-            existing.removed_at = datetime.now(UTC)
+            retire_watched_file(existing, session.get(Document, existing.doc_id) if existing.doc_id else None)
         return
 
     # Skip 0-byte files. Network shares (NFS / SMB / .AppleDouble-bearing
@@ -275,7 +406,7 @@ def handle_event(session: Session, event: FileEvent) -> None:
         return
 
     # Create / modified events: compute sha then dispatch
-    sha = _sha256_of(event.absolute_path)
+    sha = event.known_sha if event.known_sha is not None else sha256_of(event.absolute_path)
 
     # Defensive: even if the size check above somehow lets one through
     # (race between getsize and read; truncate-to-zero between syscalls),
@@ -293,10 +424,12 @@ def handle_event(session: Session, event: FileEvent) -> None:
     # Only a file the extract stage will read is retired, by the same
     # predicate: a same-stem `.json` it would decline is a document in its
     # own right, and a missing one has its own delete event.
-    if Path(event.relative_path).suffix != SIDECAR_SUFFIX:
+    if Path(event.relative_path).suffix.lower() != SIDECAR_SUFFIX:
+        entry = sidecar_entry_on_disk(event.absolute_path)
         sidecar = Path(event.absolute_path).with_suffix(SIDECAR_SUFFIX)
-        if load_sidecar(sidecar, owner=event.absolute_path, quiet=True) is not None:
-            _retire_sidecar_row(session, event.folder_id, _sidecar_relative_path(event.relative_path))
+        if entry is not None and load_sidecar(sidecar, owner=event.absolute_path, quiet=True) is not None:
+            rel_dir = posixpath.dirname(event.relative_path)
+            _retire_sidecar_row(session, event.folder_id, posixpath.join(rel_dir, entry) if rel_dir else entry)
 
     # Branch 1: existing+active+same → no-op, but for an aliased source_path, which is
     # canonicalized so the document verifies as read in place (the startup scan
@@ -330,8 +463,213 @@ def handle_event(session: Session, event: FileEvent) -> None:
         _unhide_document(session, existing.doc_id)
         return
 
+    # A file that just vanished elsewhere in this folder with this content
+    # moved here: it keeps its document (a rename whose halves arrived apart).
+    if _adopt_recently_retired(session, event, sha):
+        return
+
     # No existing row → create Document + WatchedFile + extract job
     _create_doc_and_enqueue(session, event, sha)
+
+
+def _adopt_recently_retired(session: Session, event: FileEvent, sha: bytes) -> bool:
+    """Give a new file the document of one retired moments ago in the same folder with the same content.
+
+    A rename can reach the watcher as two halves: a delete (or a create for the
+    old name, which is gone: a delete) then a create, including a case-only
+    rename split across FSEvents callbacks, or a move whose destination is
+    already gone again. The retired row is adopted only within
+    ADOPT_WINDOW_SECS, only when its own path is gone (otherwise this is a
+    copy), and only for identical content, so the adopted document's text is
+    exactly this file's.
+
+    It does not carry documents through a swap via a temp name (``mv a t;
+    mv b a; mv t b``): each move's source is back on disk when it is handled,
+    so ``_handle_moved`` compares both paths in place, and each path keeps its
+    document with the other's content, as on main.
+    """
+    cutoff = datetime.now(UTC) - timedelta(seconds=ADOPT_WINDOW_SECS)
+    candidates = (
+        session.query(WatchedFile)
+        .filter(
+            WatchedFile.folder_id == event.folder_id,
+            WatchedFile.status == WatchedFileStatus.removed,
+            WatchedFile.sha256 == sha,
+            WatchedFile.removed_at >= cutoff,
+            WatchedFile.relative_path != event.relative_path,
+        )
+        .order_by(WatchedFile.removed_at.desc())
+        .all()
+    )
+    base, _rel = _event_base(event)
+    for wf in candidates:
+        if file_exists_exact(base, wf.relative_path):
+            continue
+        doc = session.get(Document, wf.doc_id) if wf.doc_id else None
+        old_rel = wf.relative_path
+        reextract = move_needs_reextract(old_rel, event.relative_path, doc, event.absolute_path)
+        apply_move(wf, doc, event.relative_path, event.absolute_path)
+        wf.status = WatchedFileStatus.active
+        wf.removed_at = None
+        restore_document(doc)
+        if doc is not None and reextract and not _extract_queued(session, doc.doc_id):
+            _reprocess_doc(session, doc.doc_id, sha, event.absolute_path)
+        logger.info("watcher: %s is %s moved; document kept", event.relative_path, old_rel)
+        return True
+    return False
+
+
+def _handle_moved(session: Session, event: FileEvent) -> None:
+    """A file renamed or moved inside the watched folder (#847).
+
+    A known file keeps its document: the ``WatchedFile`` row and the document's
+    paths follow it in place (``relocate.apply_move``, shared with
+    ``/watch/rename``), so citations and chat history keep resolving and an
+    unchanged file is not re-indexed. The destination is then compared like
+    any modified file: changed content is reprocessed under the same doc_id,
+    and so is a move that changes its type or the metadata sidecar it reads
+    (``relocate.move_needs_reextract``). A sidecar the old name owned is then
+    judged again: with its document gone from beside it, it is an ordinary
+    document (or another sibling's sidecar), never in neither place.
+
+    The event is a hint, checked against the disk before anything moves: a
+    source still there under its exact spelling (and not the destination's
+    file) was put back by a later rename, as a safe-save swapping a temp file
+    in does, so both paths are compared by path instead (main's behaviour).
+
+    A move onto a path the index holds a row for (an atomic save renaming a
+    temp file over the original, ``mv a b`` over a live ``b``, or a path
+    retired moments ago) keeps the destination's document, which is the one
+    cited by that path; the source's row is retired as a deleted file, still
+    there to be adopted. Nothing here deletes a row or a document. A move from
+    a name the watcher ignores (an editor's temp file) is a modify of the
+    destination; a move to one is a delete of the source. A move of a sidecar
+    itself takes the delete-and-create route, where its rules live.
+    """
+    dest_rel, dest_abs = event.dest_relative_path, event.dest_absolute_path
+    assert dest_rel is not None and dest_abs is not None, "a moved event names its destination"
+    src_deleted = replace(
+        event, kind=EventKind.deleted, dest_relative_path=None, dest_absolute_path=None, known_sha=None
+    )
+    dest_modified = FileEvent(EventKind.modified, event.folder_id, dest_rel, dest_abs, known_sha=event.known_sha)
+
+    if _should_ignore(dest_rel):
+        handle_event(session, src_deleted)
+        _rejudge_old_sidecar(session, event)
+        return
+    if _should_ignore(event.relative_path) or sidecar_owner_names(event.absolute_path) or sidecar_owner_names(dest_abs):
+        handle_event(session, src_deleted)
+        handle_event(session, dest_modified)
+        return
+
+    if _exists_at_event(src_deleted) and not _same_file(event.absolute_path, dest_abs):
+        logger.info("watcher: %s moved to %s, but it is still there; compared by path", event.relative_path, dest_rel)
+        handle_event(session, replace(src_deleted, kind=EventKind.modified))
+        handle_event(session, dest_modified)
+        return
+
+    src_wf = (
+        session.query(WatchedFile).filter_by(folder_id=event.folder_id, relative_path=event.relative_path).one_or_none()
+    )
+    dest_wf = session.query(WatchedFile).filter_by(folder_id=event.folder_id, relative_path=dest_rel).one_or_none()
+    if src_wf is None or dest_wf is not None:
+        handle_event(session, src_deleted)
+        handle_event(session, dest_modified)
+        _rejudge_old_sidecar(session, event)
+        return
+
+    doc = session.get(Document, src_wf.doc_id) if src_wf.doc_id else None
+    reextract = move_needs_reextract(event.relative_path, dest_rel, doc, dest_abs)
+    apply_move(src_wf, doc, dest_rel, dest_abs)
+    session.flush()
+    if not file_exists_exact(*_event_base(dest_modified)):
+        # Gone again by the time this is handled: the next leg of a chain of
+        # renames was dropped, or the file was deleted. The row must not stay
+        # active at a missing path (a phantom in search). Retired here, its
+        # document is adopted by a create of the same content in this folder
+        # moments later (`_adopt_recently_retired`), or reaped like any other.
+        retire_watched_file(src_wf, doc)
+        logger.info("watcher: %s moved to %s, which is gone again; retired", event.relative_path, dest_rel)
+        _rejudge_old_sidecar(session, event)
+        return
+    logger.info("watcher: %s moved to %s; document kept", event.relative_path, dest_rel)
+
+    seq_before = doc.pipeline_seq if doc is not None else None
+    # Same content: a no-op, or a resurrection for a row a racing delete had
+    # retired. Changed content: reprocessed in place. This is also where a
+    # `.json` beside the new name that was indexed as a document is retired,
+    # now that it is this file's sidecar.
+    handle_event(session, dest_modified)
+    if doc is not None and reextract and doc.pipeline_seq == seq_before and not _extract_queued(session, doc.doc_id):
+        _reprocess_doc(session, doc.doc_id, src_wf.sha256, dest_abs)
+    _rejudge_old_sidecar(session, event)
+
+
+def _rejudge_old_sidecar(session: Session, event: FileEvent) -> None:
+    """Re-run the ``.json`` beside a moved file's old name through ``handle_event``.
+
+    It was that file's sidecar, read into its document and not indexed. With
+    the file gone from beside it, it is either an ordinary document or the
+    sidecar of another same-stem sibling; ``handle_event`` decides which.
+    """
+    if Path(event.relative_path).suffix.lower() == SIDECAR_SUFFIX:
+        return
+    base, _rel = _event_base(event)
+    old_target = os.path.join(base, sidecar_relative_path(event.relative_path))
+    if event.dest_relative_path is not None:
+        new_target = os.path.join(base, sidecar_relative_path(event.dest_relative_path))
+        if old_target == new_target or _same_file(old_target, new_target):
+            # A case-only rename on a case-insensitive volume: the new name
+            # reads the same sidecar, which stays where it is.
+            return
+    entry = sidecar_entry_on_disk(os.path.join(base, event.relative_path))
+    if entry is None:
+        return
+    rel_dir = posixpath.dirname(event.relative_path)
+    old_rel = posixpath.join(rel_dir, entry) if rel_dir else entry
+    handle_event(session, FileEvent(EventKind.modified, event.folder_id, old_rel, os.path.join(base, old_rel)))
+
+
+def _extract_queued(session: Session, doc_id: uuid.UUID) -> bool:
+    return (
+        session.query(IngestionJob).filter_by(doc_id=doc_id, stage=JobStage.extract, status=JobStatus.queued).first()
+        is not None
+    )
+
+
+def _handle_directory_deleted(session: Session, event: FileEvent) -> None:
+    """A subdirectory deleted or moved out of the folder: retire every file the index holds under it.
+
+    FSEvents reports a directory moved out of the tree as the directory alone,
+    with no event per file, so without this its files would stay active. Each
+    file is checked on disk first, every path component exactly, as for a
+    single delete: after ``mv Invoices invoices`` on a case-insensitive volume
+    the old spelling still resolves. The watched root itself never comes here:
+    its loss means re-attaching, never removing every document
+    (``FolderObserver``).
+    """
+    rel = event.relative_path.strip("/")
+    if rel in ("", "."):
+        return
+    base, _rel = _event_base(event)
+    prefix = rel + "/"
+    rows = (
+        session.query(WatchedFile)
+        .filter(
+            WatchedFile.folder_id == event.folder_id,
+            WatchedFile.status == WatchedFileStatus.active,
+            WatchedFile.relative_path.startswith(prefix, autoescape=True),
+        )
+        .all()
+    )
+    retired = 0
+    for wf in rows:
+        if file_exists_exact(base, wf.relative_path):
+            continue
+        retire_watched_file(wf, session.get(Document, wf.doc_id) if wf.doc_id else None)
+        retired += 1
+    if retired:
+        logger.info("watcher: directory %s removed; retired %d files under it", rel, retired)
 
 
 def _repair_source_path(session: Session, watched_file: WatchedFile) -> None:
@@ -419,10 +757,10 @@ def _reprocess_doc(session: Session, doc_id: uuid.UUID, sha: bytes, source_path:
 def _retire_sidecar_row(session: Session, folder_id: uuid.UUID, relative_path: str) -> bool:
     """Mark the WatchedFile at ``relative_path`` removed and hide its document, if it is active.
 
-    Mirrors ``api/routes/watch.py::remove_file`` rather than the delete
-    branch above: a sidecar was never a document, so it leaves search now
-    instead of lingering until the reaper hard-deletes the row 30 days on.
-    Returns True when a row was retired.
+    The same retirement as a deleted file and ``api/routes/watch.py::remove_file``
+    (``retire_watched_file``): a sidecar was never a document, so it leaves
+    search now. An admin's "deleted" outranks it and is left alone. Returns
+    True when a row was retired.
     """
     wf = (
         session.query(WatchedFile)
@@ -431,12 +769,7 @@ def _retire_sidecar_row(session: Session, folder_id: uuid.UUID, relative_path: s
     )
     if wf is None:
         return False
-    wf.status = WatchedFileStatus.removed
-    wf.removed_at = datetime.now(UTC)
-    doc = session.get(Document, wf.doc_id) if wf.doc_id else None
-    # An admin's "deleted" (DELETE /docs/{id}) outranks this; it is left alone.
-    if doc is not None and doc.status == "active":
-        doc.status = "removed"
+    retire_watched_file(wf, session.get(Document, wf.doc_id) if wf.doc_id else None)
     logger.info("watcher: %s is a metadata sidecar of a sibling document; retired its own document row", relative_path)
     return True
 
@@ -473,11 +806,17 @@ def _reextract_sidecar_owners(session: Session, event: FileEvent, owner_names: I
     re-queued with a bumped generation; that is also what keeps a document
     and its sidecar landing together from being extracted twice (one already
     running is replaced, and may run twice: a stale snapshot of the sidecar
-    is worse). Returns how many documents were re-queued.
+    is worse). An owner whose `metadata.sidecar` already holds exactly what
+    the file now says (the sidecar moved along with it, or was touched) is
+    left alone: re-extracting takes it out of search until reprocessed.
+    Returns how many documents were re-queued.
     """
     parent = Path(event.absolute_path).parent
+    content = load_sidecar(Path(event.absolute_path), owner=event.absolute_path, quiet=True)
     requeued = 0
-    for rel, wf, _doc in _active_owner_docs(session, event, owner_names):
+    for rel, wf, doc in _active_owner_docs(session, event, owner_names):
+        if content is not None and (doc.doc_metadata or {}).get("sidecar") == content:
+            continue
         pending = (
             session.query(IngestionJob)
             .filter_by(doc_id=wf.doc_id, stage=JobStage.extract, status=JobStatus.queued)
@@ -523,17 +862,15 @@ def _drop_sidecar_namespace(session: Session, event: FileEvent, owner_names: Ite
 def _unhide_document(session: Session, doc_id: uuid.UUID | None) -> None:
     """Undo a retire when a resurrected row's document is hidden.
 
-    A row can be marked removed with its document set to "removed" (a sidecar
-    whose sibling has since gone, or the API's /watch/remove); a live
+    A removed row has its document set to "removed" (a deleted file, a
+    sidecar whose sibling has since gone, or the API's /watch/remove); a live
     WatchedFile pointing at a hidden document would be unreachable. Only that
-    state is undone: an admin's "deleted" (DELETE /docs/{id}) is not the
-    watcher's to revive, whatever happens to the file on disk.
+    state is undone (``restore_document``): an admin's "deleted" (DELETE
+    /docs/{id}) is not the watcher's to revive, whatever happens on disk.
     """
     if doc_id is None:
         return
-    doc = session.get(Document, doc_id)
-    if doc is not None and doc.status == "removed":
-        doc.status = "active"
+    restore_document(session.get(Document, doc_id))
 
 
 def _try_parse_eml(absolute_path: str) -> EmailParseResult | None:
