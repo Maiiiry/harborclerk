@@ -59,3 +59,5 @@ def test_resolve_tmpdir_pytesseract_writes_to_resolved_path(monkeypatch, tmp_pat
     # tempfile module should now produce paths under the resolved location
     with tempfile.NamedTemporaryFile(prefix="tess_", delete=True) as f:
         assert os.path.realpath(f.name).startswith(str(real))
+
+# Automated fix for issue #931: Fresh checkouts fail to sync on machines with Python 3.15: requires-python has no upper bound and torch has no cp315 wheels
